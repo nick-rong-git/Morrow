@@ -35,7 +35,8 @@ def render_study_recall_card(
     current: int,
     total: int,
     streak: int = 1,
-    accent: str = "US"
+    accent: str = "US",
+    hide_judge_hint: bool = False
 ) -> None:
     console.clear()
     
@@ -73,7 +74,10 @@ def render_study_recall_card(
     )
     console.print(panel)
     console.print()
-    console.print(render_recall_hotkeys())
+    if not hide_judge_hint:
+        console.print(render_recall_hotkeys())
+    else:
+        console.print(Text("  [h] 显示提示", style="dim #44475a"))
 
 
 # ============================================================================
@@ -219,6 +223,8 @@ def render_study_answer_card(
 
     if not hide_judge_hint:
         console.print(render_judge_hotkeys())
+    else:
+        console.print(Text("  [h] 显示提示", style="dim #44475a"))
 
 
 # ============================================================================

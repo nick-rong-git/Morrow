@@ -125,7 +125,7 @@ async def run_learning_session(client: MorrowClient, config: Config, console: Co
 
         while True:
             if ui_mode == "study":
-                render_study_recall_card(console, word, current_idx, srv_total, streak, accent)
+                render_study_recall_card(console, word, current_idx, srv_total, streak, accent, config.hide_judge_hint)
             else:
                 render_disguise_recall_panel(console, word, current_idx, srv_total)
 
@@ -138,6 +138,10 @@ async def run_learning_session(client: MorrowClient, config: Config, console: Co
             if kl == "b":
                 trigger_boss(console)
                 await async_read_key()
+                continue
+            if kl == "h":
+                config.set("hide_judge_hint", not config.hide_judge_hint)
+                config.save()
                 continue
             if kl == "p":
                 play_word_sound(word, accent)
@@ -191,6 +195,10 @@ async def run_learning_session(client: MorrowClient, config: Config, console: Co
                 trigger_boss(console)
                 await async_read_key()
                 judge_start = time.monotonic()
+                continue
+            if kl == "h":
+                config.set("hide_judge_hint", not config.hide_judge_hint)
+                config.save()
                 continue
             if kl == "p":
                 play_word_sound(word, accent)
@@ -317,11 +325,18 @@ def main():
         streak_info = client.fetch_user_streak()
         streak = streak_info.get("streak", 1)
 
-        # 渲染主菜单
-        console.print()
-        console.print(Text(f"  🔥 墨墨已连续打卡: {streak} 天  │  界面模式: [{config.ui_mode}]  │  默认发音: [{config.accent}]", style="bold #50fa7b"))
-        console.print()
-        console.print(Text("  按 [y] 开始背词   [r] 提前复习   [/] 查词典   [m] 切伪装模式   [q] 退出", style="bold #00f0ff"))
+        def _render_menu():
+            console.clear()
+            render_banner(console)
+            console.print()
+            console.print(Text(f"  🔥 墨墨已连续打卡: {streak} 天  │  界面模式: [{config.ui_mode}]  │  默认发音: [{config.accent}]", style="bold #50fa7b"))
+            console.print()
+            if not config.hide_judge_hint:
+                console.print(Text("  按 [y] 开始背词   [r] 提前复习   [/] 查词典   [m] 切伪装模式   [h] 隐藏提示   [q] 退出", style="bold #00f0ff"))
+            else:
+                console.print(Text("  按 [y] 开始背词  │  [h] 显示提示", style="dim #6272a4"))
+
+        _render_menu()
 
         while True:
             k = await async_read_key()
@@ -336,12 +351,16 @@ def main():
                     break
             elif kl == "/":
                 show_dictionary_modal(console)
-                console.print(Text("\n  按 [y] 开始背词   [r] 提前复习   [/] 查词典   [q] 退出", style="bold #00f0ff"))
+                _render_menu()
+            elif kl == "h":
+                config.set("hide_judge_hint", not config.hide_judge_hint)
+                config.save()
+                _render_menu()
             elif kl == "m":
                 new_mode = "disguise" if config.ui_mode == "study" else "study"
                 config.set("ui_mode", new_mode)
                 config.save()
-                console.print(Text(f"  [设置] 已切换至: [{new_mode}] 模式", style="bold #bd93f9"))
+                _render_menu()
             elif kl == "q":
                 break
 

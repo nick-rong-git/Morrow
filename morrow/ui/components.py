@@ -69,6 +69,9 @@ def render_judge_hotkeys() -> Text:
     t.append("[/] ", style="bold #50fa7b")
     t.append("查词  ", style="#50fa7b")
     
+    t.append("[h] ", style="dim")
+    t.append("隐提示  ", style="dim")
+
     t.append("[m] ", style="dim")
     t.append("伪装  ", style="dim")
     
@@ -98,6 +101,9 @@ def render_recall_hotkeys() -> Text:
     
     t.append("[/] ", style="bold #50fa7b")
     t.append("即时查词  ", style="#50fa7b")
+
+    t.append("[h] ", style="dim")
+    t.append("隐提示  ", style="dim")
     
     t.append("[m] ", style="dim")
     t.append("切伪装  ", style="dim")
