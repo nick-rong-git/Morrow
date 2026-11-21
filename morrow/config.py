@@ -13,7 +13,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "ws_token": "",
     "rest_token": "",
     "ui_mode": "study",          # "study" (全功能卡片) 或 "disguise" (摸鱼模式)
-    "auto_play_audio": True,     # 第一屏自动播放单词真人发音
+    "auto_play_audio": True,     # 是否自动播放单词发音
+    "word_audio_timing": "answer",  # "answer" 翻面时，"recall" 看词时
     "auto_play_example": False,  # 第二屏自动朗读第一条例句
     "accent": "US",              # "US" (美音) 或 "UK" (英音)
     "data_dir": "data",          # 数据与缓存根目录
@@ -103,6 +104,13 @@ class Config:
     @property
     def auto_play_audio(self) -> bool:
         return bool(self._data.get("auto_play_audio", True))
+
+    @property
+    def word_audio_timing(self) -> str:
+        if not self.auto_play_audio:
+            return "off"
+        timing = self._data["word_audio_timing"]
+        return "recall" if timing == "recall" else "answer"
 
     @property
     def auto_play_example(self) -> bool:

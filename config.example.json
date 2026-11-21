@@ -3,6 +3,7 @@
     "rest_token": "YOUR_MAIMEMO_REST_TOKEN_HERE",
     "ui_mode": "study",
     "auto_play_audio": true,
+    "word_audio_timing": "answer",
     "auto_play_example": false,
     "accent": "US",
     "data_dir": "data",

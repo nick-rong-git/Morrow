@@ -45,8 +45,8 @@ def render_judge_hotkeys() -> Text:
     t.append("斩词/熟知  ", style="#bd93f9")
     
     t.append("│  ", style="dim #6272a4")
-    t.append("[p] ", style="bold #00f0ff")
-    t.append("单词发音  ", style="#00f0ff")
+    t.append("[回车/空格/p] ", style="bold #00f0ff")
+    t.append("重播单词  ", style="#00f0ff")
     
     t.append("[e] ", style="bold #8be9fd")
     t.append("读例句(4/5/6)  ", style="#8be9fd")
@@ -67,8 +67,8 @@ def render_judge_hotkeys() -> Text:
     t.append("[m] ", style="dim")
     t.append("伪装  ", style="dim")
     
-    t.append("[b] ", style="dim")
-    t.append("boss  ", style="dim")
+    t.append("[Esc/b] ", style="dim")
+    t.append("老板键  ", style="dim")
     
     t.append("[q] ", style="dim")
     t.append("退出", style="dim")
@@ -100,7 +100,7 @@ def render_recall_hotkeys() -> Text:
     t.append("[m] ", style="dim")
     t.append("切伪装  ", style="dim")
     
-    t.append("[b] ", style="dim")
+    t.append("[Esc/b] ", style="dim")
     t.append("老板键  ", style="dim")
     
     t.append("[q] ", style="dim")

@@ -156,19 +156,21 @@ class AudioEngine:
             worker(*args, cancelled)
 
     def play_word(
-        self, url: str, async_play: bool = True, *, fallback_text: str = "", accent: str = "US",
+        self, url: str, async_play: bool = True, *, fallback_text: str = "", accent: str = "US", example: str = "",
     ) -> None:
-        if url or fallback_text:
-            self._play(self._play_word_sync, (url, fallback_text, accent), async_play)
+        example = example.strip()
+        if url or fallback_text or example:
+            self._play(self._play_word_sync, (url, fallback_text, accent, example), async_play)
 
-    def _play_word_sync(self, url, fallback_text, accent, cancelled) -> None:
+    def _play_word_sync(self, url, fallback_text, accent, example, cancelled) -> None:
         if cancelled.is_set():
             return
         path = self.download_url_if_needed(url)
-        if path and self._play_file_sync(path, cancelled):
-            return
-        if fallback_text and not cancelled.is_set():
+        played = path is not None and self._play_file_sync(path, cancelled)
+        if not played and fallback_text and not cancelled.is_set():
             self._speak_sentence_sync(fallback_text, accent, cancelled)
+        if example and not cancelled.is_set():
+            self._speak_sentence_sync(example, accent, cancelled)
 
     async def _async_synth_edge(self, text: str, voice: str, path: str) -> bool:
         if edge_tts is None:

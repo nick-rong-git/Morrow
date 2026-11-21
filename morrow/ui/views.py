@@ -67,7 +67,7 @@ def trigger_boss(console: Console) -> None:
     console.print()
     console.print(t)
     console.print()
-    console.print(Text("  [任意键安全返回学习界面 ...]", style="dim italic #44475a"))
+    console.print(Text("  [按任意键返回原界面]", style="dim italic #44475a"))
 
 
 # ============================================================================
@@ -200,7 +200,7 @@ def show_completion_screen(console: Console, stats: Dict[str, Any], streak: int 
     )
     console.print(panel)
     console.print()
-    console.print(Text("  [r] 提前复习(再来一批)   [/] 查词典   [q] 退出程序", style="bold #8be9fd"))
+    console.print(Text("  [r] 提前复习(再来一批)   [/] 查词典   [Esc/b] 老板键   [q] 退出程序", style="bold #8be9fd"))
 
 
 # ============================================================================
@@ -319,6 +319,7 @@ async def _update_rest_token(console: Console, config) -> bool:
 
 
 async def show_settings_modal(console: Console, config) -> None:
+    audio_labels = {"answer": "翻面时", "recall": "看词时", "off": "关闭"}
     message = ""
     while True:
         console.clear()
@@ -331,7 +332,7 @@ async def show_settings_modal(console: Console, config) -> None:
         t.add_row(Text("[2]"), "打开官网并更新开放 API 凭证", "已设置" if config.rest_token else "未设置")
         t.add_row(Text("[3]"), "打开墨墨学习网页", WEB_STUDY_URL)
         t.add_row(Text("[4]"), "发音偏好 (美音 / 英音)", config.accent)
-        t.add_row(Text("[5]"), "单词自动发音", "开启" if config.auto_play_audio else "关闭")
+        t.add_row(Text("[5]"), "单词自动发音时机", audio_labels[config.word_audio_timing])
         t.add_row(Text("[6]"), "例句自动朗读", "开启" if config.auto_play_example else "关闭")
         t.add_row(Text("[7]"), "手动更新背词凭证", "粘贴 WebSocket 地址或 ws_token")
 
@@ -362,7 +363,17 @@ async def show_settings_modal(console: Console, config) -> None:
         elif choice == "4":
             saved = config.update(accent="UK" if config.accent == "US" else "US")
         elif choice == "5":
-            saved = config.update(auto_play_audio=not config.auto_play_audio)
+            option = await _ask(
+                console, "  1 翻面时  2 看词时  3 关闭自动发音  q 返回",
+                choices=["1", "2", "3", "q"], default="q", show_choices=False, show_default=False,
+            )
+            if option == "q":
+                continue
+            if option == "3":
+                saved = config.update(auto_play_audio=False)
+            else:
+                timing = "answer" if option == "1" else "recall"
+                saved = config.update(auto_play_audio=True, word_audio_timing=timing)
         elif choice == "6":
             saved = config.update(auto_play_example=not config.auto_play_example)
         else:

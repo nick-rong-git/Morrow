@@ -2,12 +2,11 @@
 Morrow 核心卡片渲染引擎 (Cards Engine)
 包含两套顶级视觉模式：
 1. 全功能学习卡片 (Study Card Mode)：高信息密度、优雅排版、例句发音指引。
-2. 摸鱼代码伪装面板 (Disguise Mode)：100% 仿真为 IDE 编译输出与微服务日志。
+2. 代码伪装模式 (Disguise Mode)：用单色 JSON 显示当前单词。
 """
 
-import time
 import json
-from typing import Dict, Any, List
+from typing import Any, Dict, Iterator, List
 from rich.console import Console
 from rich.text import Text
 from rich.panel import Panel
@@ -24,9 +23,27 @@ PARTS_OF_SPEECH = {
     "a", "abbr", "ad", "adj", "adv", "art", "aux", "conj", "det", "int", "interj",
     "modal", "n", "num", "phr", "prep", "pron", "v", "vi", "vt",
 }
+EXAMPLE_KEYS = ("4", "5", "6")
 
-def _now_str() -> str:
-    return time.strftime("%H:%M:%S")
+
+def _definition_rows(word: Dict[str, Any]) -> Iterator[tuple[str, str]]:
+    interpretations = word.get("interpretations") or [word.get("interpretation") or ""]
+    for interpretation in interpretations:
+        for raw_line in interpretation.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            prefix, dot, meaning = line.partition(".")
+            prefix = prefix.rstrip()
+            if dot and prefix.lower() in PARTS_OF_SPEECH:
+                yield f"[{prefix}.]", meaning.lstrip()
+            else:
+                yield "", line
+
+
+def get_study_examples(word: Dict[str, Any]) -> List[Dict[str, Any]]:
+    phrases = word.get("phrases") or []
+    return [phrase for phrase in phrases if phrase.get("en", "").strip()][:len(EXAMPLE_KEYS)]
 
 # ============================================================================
 # 全功能模式：看词回忆阶段卡片
@@ -67,7 +84,7 @@ def render_study_recall_card(
     if difficulty:
         content.append(" " + "★" * min(5, difficulty), style="#f1fa8c")
         
-    content.append("\n\n(回忆释义后，按空格或回车查看答案)\n", style="italic dim #6272a4")
+    content.append("\n\n(先回忆读音和释义，再按空格或回车查看答案)\n", style="italic dim #6272a4")
 
     panel = Panel(
         Align.center(content),
@@ -135,30 +152,19 @@ def render_study_answer_card(
     interp_table.add_column(min_width=8, no_wrap=True, style="bold #50fa7b")
     interp_table.add_column(style=f"bold {COLOR_TEXT_MAIN}")
 
-    interpretations = word.get("interpretations") or [word.get("interpretation") or ""]
-    for interpretation in interpretations:
-        for raw_line in interpretation.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            prefix, dot, meaning = line.partition(".")
-            prefix = prefix.rstrip()
-            if dot and prefix.lower() in PARTS_OF_SPEECH:
-                interp_table.add_row(Text(f"[{prefix}.]"), Text(meaning.lstrip()))
-            else:
-                interp_table.add_row("•", Text(line))
+    for label, meaning in _definition_rows(word):
+        interp_table.add_row(Text(label or "•"), Text(meaning))
 
     # 3. 精选例句与短语
-    phrases = word.get("phrases", [])
     phrase_elements: List[Text] = []
-    for idx, p in enumerate(phrases[:3]):
+    for key, p in zip(EXAMPLE_KEYS, get_study_examples(word)):
         en = p.get("en", "")
         cn = p.get("cn", "")
         hl = p.get("highlight")
         tags = p.get("tags", [])
 
         pt = Text()
-        pt.append(f"[{idx + 4}] ", style="bold #8be9fd")
+        pt.append(f"[{key}] ", style="bold #8be9fd")
         
         # 关键词高亮
         if hl and len(hl) == 2 and 0 <= hl[0] < hl[1] <= len(en):
@@ -229,7 +235,7 @@ def render_study_answer_card(
 
 
 # ============================================================================
-# 摸鱼模式：极简实用无色 JSON 格式（无多余字段，无滚动负担，零颜色）
+# 代码伪装模式：单色 JSON
 # ============================================================================
 
 def _clean_phonetic(ph: str) -> str:
@@ -264,7 +270,7 @@ def render_disguise_recall_panel(
     if hide_judge_hint:
         console.print("[h] show keys", markup=False, highlight=False, style="none")
     else:
-        console.print("[Space] view  [p] audio  [t] accent  [u] undo  [/] lookup  [h] hide  [m] mode  [b] boss  [q] quit", markup=False, highlight=False, style="none")
+        console.print("[Enter/Space] view  [p] audio  [t] accent  [u] undo  [/] lookup  [h] hide  [m] mode  [Esc/b] boss  [q] quit", markup=False, highlight=False, style="none")
 
 
 def render_disguise_answer_panel(
@@ -278,30 +284,18 @@ def render_disguise_answer_panel(
     spelling = word.get("spelling", "")
     ph = word.get("phonetic_us") or word.get("phonetic_uk") or ""
 
-    # 释义精简为整洁的单行中文
-    interpretations = word.get("interpretations", [])
-    if not interpretations and word.get("interpretation"):
-        interpretations = [l.strip() for l in word["interpretation"].split("\n") if l.strip()]
-    trans = "；".join(interpretations) if interpretations else word.get("interpretation", "")
+    definitions = [f"{label} {meaning}" if label else meaning for label, meaning in _definition_rows(word)]
+    examples = []
+    for phrase in get_study_examples(word):
+        en = phrase["en"].strip()
+        cn = phrase.get("cn", "").strip()
+        examples.append(f"{en} // {cn}" if cn else en)
 
-    # 仅精选 1 条高频例句，单行呈现
-    example = ""
-    phrases = word.get("phrases", [])
-    if phrases:
-        p0 = phrases[0]
-        en = p0.get("en", "").strip()
-        cn = p0.get("cn", "").strip()
-        if en and cn:
-            example = f"{en} // {cn}"
-        elif en:
-            example = en
-
-    # 极简紧凑 JSON（仅核心字段，5-8 行，一屏即览，完全单色）
     data = {
         "word": spelling,
         "phonetic": _clean_phonetic(ph),
-        "trans": trans,
-        "example": example,
+        "trans": definitions,
+        "examples": examples,
         "progress": f"{min(current, total)}/{total}" if total > 0 else str(current)
     }
 
@@ -315,10 +309,16 @@ def render_disguise_answer_panel(
             data["note"] = f"[{t}] {c}" if t else c
 
     json_text = json.dumps(data, ensure_ascii=False, indent=2)
-    console.print(json_text, markup=False, highlight=False, style="none")
+    console.print(json_text, markup=False, highlight=False, style="none", soft_wrap=True)
     console.print()
 
     if hide_judge_hint:
         console.print("[h] show keys", markup=False, highlight=False, style="none")
     else:
-        console.print("[1] pass  [2] vague  [3] fail  [0] kill  |  [p] audio  [e] sentence  [t] accent  |  [u] undo  [/] search  [h] hide  [m] mode  [b] boss  [q] quit", markup=False, highlight=False, style="none")
+        keys = "/".join(EXAMPLE_KEYS[:len(examples)])
+        example_hint = f"  [e] first  [{keys}] examples" if keys else ""
+        console.print(
+            f"[1] pass  [2] vague  [3] fail  [0] kill  |  [Enter/Space/p] replay word{example_hint}  [t] accent  |  "
+            "[u] undo  [/] search  [h] hide  [m] mode  [Esc/b] boss  [q] quit",
+            markup=False, highlight=False, style="none",
+        )

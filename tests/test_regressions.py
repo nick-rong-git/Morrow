@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 from urllib.error import HTTPError
 
 from rich.console import Console
@@ -32,7 +32,7 @@ from morrow.client import (
 )
 from morrow.config import Config
 from morrow.ui import views
-from morrow.ui.cards import render_study_answer_card
+from morrow.ui.cards import render_disguise_answer_panel, render_study_answer_card
 
 
 def word_data(word_id, finished=0):
@@ -83,6 +83,161 @@ class AsyncRegressions(unittest.IsolatedAsyncioTestCase):
         self.config.set("auto_play_audio", False)
         self.buffer = StringIO()
         self.console = Console(file=self.buffer, width=120)
+
+    async def test_boss_keys_resume_the_same_learning_stage(self):
+        client = Mock(
+            progress={},
+            get_word=AsyncMock(return_value={"id": "company", "spelling": "company"}),
+            submit_response=AsyncMock(),
+        )
+        keys = AsyncMock(side_effect=["\x1b", " ", "\r", "b", "1", "q"])
+        with (
+            patch.object(cli, "async_read_key", keys),
+            patch.object(cli, "audio_engine") as audio,
+            patch.object(cli, "trigger_boss") as boss,
+            patch.object(cli, "render_study_recall_card") as recall,
+            patch.object(cli, "render_study_answer_card") as answer,
+        ):
+            await cli.run_learning_session(client, self.config, self.console)
+        self.assertEqual(boss.call_args_list, [call(self.console)] * 2)
+        self.assertEqual(audio.stop.call_count, 3)
+        self.assertEqual(recall.call_count, 2)
+        self.assertEqual(answer.call_count, 2)
+        client.submit_response.assert_not_awaited()
+
+    async def test_boss_keys_are_available_on_home_and_completion_screens(self):
+        with (
+            patch.object(cli, "async_read_key", AsyncMock(side_effect=["B", "y", "q"])),
+            patch.object(cli, "audio_engine"),
+            patch.object(cli, "trigger_boss") as boss,
+            patch.object(cli, "show_token_wizard", AsyncMock(return_value=False)) as wizard,
+        ):
+            await cli._run(self.console, self.config)
+        boss.assert_called_once_with(self.console)
+        wizard.assert_awaited_once()
+
+        client = Mock(get_word=AsyncMock(return_value={}))
+        with (
+            patch.object(cli, "async_read_key", AsyncMock(side_effect=["\x1b", "r", "q"])),
+            patch.object(cli, "audio_engine"),
+            patch.object(cli, "trigger_boss") as boss,
+            patch.object(cli, "show_advance_review_modal", AsyncMock()) as add_review,
+        ):
+            await cli.run_learning_session(client, self.config, self.console)
+        boss.assert_called_once_with(self.console)
+        add_review.assert_not_awaited()
+
+    async def test_unix_standalone_escape_is_returned_after_filtering_sequences(self):
+        fd = 5
+        ready, idle = ([fd], [], []), ([], [], [])
+        select = Mock(select=Mock(side_effect=[ready, ready, ready, ready, idle, ready, idle]))
+        tty = Mock()
+        termios = Mock(TCSADRAIN=1, tcgetattr=Mock(return_value="original"))
+        stdin = Mock(isatty=Mock(return_value=True), fileno=Mock(return_value=fd))
+        with (
+            patch.object(cli.sys, "stdin", stdin),
+            patch.object(cli.sys, "platform", "linux"),
+            patch.dict(cli.sys.modules, {"select": select, "tty": tty, "termios": termios}),
+            patch.object(cli.os, "read", side_effect=[b"\x1b", b"[", b"3", b"~", b"\x1b"]),
+        ):
+            self.assertEqual(await cli.async_read_key(), "\x1b")
+        termios.tcsetattr.assert_called_once_with(fd, termios.TCSADRAIN, "original")
+
+    async def test_disguise_example_keys_play_the_displayed_sentences(self):
+        self.config.set("ui_mode", "disguise")
+        client = Mock(
+            progress={"finished": 301, "total": 500},
+            get_word=AsyncMock(return_value={
+                "id": "company",
+                "spelling": "company",
+                "phrases": [{"en": "First."}, {"en": " "}, {"en": "Second."}, {"en": "Third."}],
+            }),
+        )
+        with (
+            patch.object(cli, "async_read_key", AsyncMock(side_effect=[" ", "e", "5", "6", "q"])),
+            patch.object(cli, "audio_engine") as audio,
+        ):
+            await cli.run_learning_session(client, self.config, self.console)
+        self.assertIn("[4/5/6] examples", self.buffer.getvalue())
+        self.assertEqual(audio.speak_sentence.call_args_list, [
+            call("First.", accent="US"),
+            call("Second.", accent="US"),
+            call("Third.", accent="US"),
+        ])
+
+    async def test_word_audio_starts_after_reveal_and_replays_in_both_modes(self):
+        word = {"id": "company", "spelling": "company", "audio_uk": "https://example.invalid/uk.mp3"}
+        client = Mock(progress={}, get_word=AsyncMock(return_value=word))
+        for mode, answer_marker in (("study", "MORROW ANSWER"), ("disguise", '"trans":')):
+            with self.subTest(mode=mode):
+                self.config.set("ui_mode", mode)
+                self.config.set("auto_play_audio", True)
+                output_start = len(self.buffer.getvalue())
+                keys = iter(["t", "\r", " ", "\n", "q"])
+                play_counts = []
+                audio = Mock()
+
+                async def read_key():
+                    play_counts.append(audio.play_word.call_count)
+                    return next(keys)
+
+                def play_word(*args, **kwargs):
+                    self.assertIn(answer_marker, self.buffer.getvalue()[output_start:])
+
+                audio.play_word.side_effect = play_word
+                with patch.object(cli, "async_read_key", read_key), patch.object(cli, "audio_engine", audio):
+                    await cli.run_learning_session(client, self.config, self.console)
+                self.assertEqual(play_counts, [0, 0, 1, 2, 3])
+                self.assertEqual(audio.play_word.call_args_list, [
+                    call(word["audio_uk"], fallback_text="company", accent="UK", example=""),
+                ] * 3)
+
+    async def test_reveal_with_both_audio_preferences_and_manual_replay(self):
+        self.config.set("auto_play_example", True)
+        word = {"id": "company", "spelling": "company", "phrases": [{"en": "First sentence."}]}
+        client = Mock(progress={}, get_word=AsyncMock(return_value=word))
+        replay = call("", fallback_text="company", accent="US", example="")
+        for auto_word in (True, False):
+            with self.subTest(auto_word=auto_word):
+                self.config.set("auto_play_audio", auto_word)
+                with (
+                    patch.object(cli, "async_read_key", AsyncMock(side_effect=[" ", "\r", "q"])),
+                    patch.object(cli, "audio_engine") as audio,
+                ):
+                    await cli.run_learning_session(client, self.config, self.console)
+                if auto_word:
+                    self.assertEqual(audio.play_word.call_args_list, [
+                        call("", fallback_text="company", accent="US", example="First sentence."),
+                        replay,
+                    ])
+                    audio.speak_sentence.assert_not_called()
+                else:
+                    self.assertEqual(audio.play_word.call_args_list, [replay])
+                    audio.speak_sentence.assert_called_once_with("First sentence.", accent="US")
+
+    async def test_recall_audio_preference_plays_once_before_reveal(self):
+        self.config.set("auto_play_audio", True)
+        self.config.set("word_audio_timing", "recall")
+        word = {"id": "company", "spelling": "company"}
+        client = Mock(progress={}, get_word=AsyncMock(return_value=word))
+        keys = iter([" ", "\r", "q"])
+        play_counts = []
+        audio = Mock()
+
+        async def read_key():
+            play_counts.append(audio.play_word.call_count)
+            return next(keys)
+
+        with patch.object(cli, "async_read_key", read_key), patch.object(cli, "audio_engine", audio):
+            await cli.run_learning_session(client, self.config, self.console)
+        self.assertEqual(play_counts, [1, 1, 2])
+
+    async def test_settings_saves_each_word_audio_timing(self):
+        for option, expected in (("2", "recall"), ("3", "off"), ("1", "answer")):
+            with self.subTest(timing=expected):
+                with patch.object(views, "_ask", AsyncMock(side_effect=["5", option, "q"])):
+                    await views.show_settings_modal(self.console, self.config)
+                self.assertEqual(Config(self.config.config_path).word_audio_timing, expected)
 
     async def connect(self, socket):
         client = MorrowClient("test+token")
@@ -331,8 +486,53 @@ class CardRegressions(unittest.TestCase):
                 self.assertRegex(card, r"\[interj\.\] +哎呀")
                 self.assertRegex(card, r"• +1\. 保留编号")
 
+    def test_disguise_separates_definitions_and_keeps_three_examples(self):
+        word = {
+            "spelling": "company",
+            "phonetic_us": "/ˈkʌmpəni/",
+            "interpretations": ["n. 公司；陪伴；同伴；剧团\nv. 陪伴", "用法说明"],
+            "phrases": [
+                {"en": "It's sad that we have to part company with them.", "cn": "很遗憾我们不得不和他们分开。"},
+                {"en": "The company is expanding."},
+                {"en": "Thanks for keeping me company.", "cn": "谢谢你陪我。"},
+                {"en": "A fourth example."},
+            ],
+        }
+        for width in (54, 120):
+            with self.subTest(width=width):
+                output = StringIO()
+                render_disguise_answer_panel(Console(file=output, width=width), word, 302, 500)
+                payload, _, hints = output.getvalue().partition("\n\n")
+                data = json.loads(payload)
+                self.assertEqual(data["trans"], ["[n.] 公司；陪伴；同伴；剧团", "[v.] 陪伴", "用法说明"])
+                self.assertEqual(data["examples"], [
+                    "It's sad that we have to part company with them. // 很遗憾我们不得不和他们分开。",
+                    "The company is expanding.",
+                    "Thanks for keeping me company. // 谢谢你陪我。",
+                ])
+                self.assertEqual(data["progress"], "302/500")
+                self.assertIn("\n    \"[v.] 陪伴\"", payload)
+                self.assertIn("[4/5/6]", hints)
+
+    def test_disguise_shows_empty_examples_without_audio_shortcuts(self):
+        output = StringIO()
+        word = {"spelling": "company", "interpretation": "n. 公司\nv. 陪伴"}
+        render_disguise_answer_panel(Console(file=output, width=100), word, 1, 1)
+        payload, _, hints = output.getvalue().partition("\n\n")
+        self.assertEqual(json.loads(payload)["trans"], ["[n.] 公司", "[v.] 陪伴"])
+        self.assertEqual(json.loads(payload)["examples"], [])
+        self.assertNotIn("[e]", hints)
+
 
 class StorageRegressions(unittest.TestCase):
+    def test_existing_configs_preserve_audio_opt_out_and_default_to_reveal(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            for enabled, expected in ((False, "off"), (True, "answer")):
+                with self.subTest(enabled=enabled):
+                    path.write_text(json.dumps({"auto_play_audio": enabled}), encoding="utf-8")
+                    self.assertEqual(Config(path).word_audio_timing, expected)
+
     def test_reads_clipboard_text_only_after_a_new_copy(self):
         api = Mock(
             CF_UNICODETEXT=13,
@@ -412,6 +612,31 @@ class StorageRegressions(unittest.TestCase):
             self.assertIsNotNone(results[0])
             self.assertEqual(results, [results[0]] * 6)
             self.assertEqual(list(Path(directory).iterdir()), [Path(results[0])])
+
+    def test_playback_sequences_example_after_word_and_respects_cancellation(self):
+        audio = AudioEngine()
+        audio._winmm = Mock()
+        playback = Mock()
+        playback.word.return_value = True
+        with (
+            patch.object(audio, "download_url_if_needed", return_value="word.mp3"),
+            patch.object(audio, "_play_file_sync", playback.word),
+            patch.object(audio, "_speak_sentence_sync", playback.speak),
+        ):
+            audio.play_word("https://example.invalid/word.mp3", async_play=False, example="Example.")
+            self.assertEqual(playback.mock_calls, [
+                call.word("word.mp3", audio._cancelled),
+                call.speak("Example.", "US", audio._cancelled),
+            ])
+            playback.reset_mock()
+
+            def cancel(*args):
+                audio.stop()
+                return True
+
+            playback.word.side_effect = cancel
+            audio.play_word("https://example.invalid/word.mp3", async_play=False, example="Example.")
+            playback.speak.assert_not_called()
 
     def test_stop_interrupts_playback(self):
         audio = AudioEngine()

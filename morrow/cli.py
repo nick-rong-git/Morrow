@@ -14,6 +14,8 @@ from .audio import audio_engine
 from .client import MorrowClient
 from .config import Config
 from .ui import (
+    EXAMPLE_KEYS,
+    get_study_examples,
     render_banner,
     render_disguise_answer_panel,
     render_disguise_recall_panel,
@@ -73,21 +75,30 @@ async def async_read_key() -> str:
                 key = os.read(fd, 1)
                 if not key or key == b"\x04":
                     raise EOFError
-                if key == b"\x1b":
-                    # 消费方向键等终端转义序列，避免把序列里的数字当成判答键。
-                    while select.select([fd], [], [], 0.025)[0]:
-                        os.read(fd, 1)
-                else:
+                if key != b"\x1b" or not select.select([fd], [], [], 0.025)[0]:
                     return key.decode("ascii", errors="replace")
+                # 单独的 Esc 已返回，继续消费方向键等转义序列。
+                while os.read(fd, 1) and select.select([fd], [], [], 0.025)[0]:
+                    pass
             await asyncio.sleep(0.025)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
-def play_word_sound(word: Dict[str, Any], accent: str) -> None:
+async def _read_command(console: Console) -> str:
+    key = (await async_read_key()).lower()
+    if key in ("\x1b", "b"):
+        audio_engine.stop()
+        trigger_boss(console)
+        await async_read_key()
+        return ""
+    return key
+
+
+def play_word_sound(word: Dict[str, Any], accent: str, *, example: str = "") -> None:
     speeches = word.get("speeches", {})
     url = speeches.get(accent) or word.get(f"audio_{accent.lower()}") or word.get("audio_us") or word.get("audio_uk")
-    audio_engine.play_word(url or "", fallback_text=word.get("spelling", ""), accent=accent)
+    audio_engine.play_word(url or "", fallback_text=word.get("spelling", ""), accent=accent, example=example)
 
 
 async def _get_word(client: MorrowClient) -> Dict[str, Any]:
@@ -104,13 +115,14 @@ async def run_learning_session(
     history = []
     accent = config.accent
     ui_mode = config.ui_mode
+    word_audio_timing = config.word_audio_timing
     word = await _get_word(client)
 
     while True:
         if not word.get("id"):
             audio_engine.stop()
             show_completion_screen(console, stats)
-            key = (await async_read_key()).lower()
+            key = await _read_command(console)
             if key == "q":
                 return
             if key == "r" and await show_advance_review_modal(console, client):
@@ -119,15 +131,16 @@ async def run_learning_session(
                 await show_dictionary_modal(console)
             continue
 
-        phrases = [phrase.get("en", "") for phrase in word.get("phrases", [])[:3]]
+        phrases = [phrase["en"] for phrase in get_study_examples(word)]
         finished = client.progress.get("finished", 0)
         total = client.progress.get("total", 0)
         recall_start = time.monotonic()
         judge_start = None
         recall_ms = 0
+        reveal_audio = False
         feedback = ""
         audio_engine.stop()
-        if config.auto_play_audio:
+        if word_audio_timing == "recall":
             play_word_sound(word, accent)
         for phrase in phrases:
             audio_engine.prefetch_sentence(phrase, accent=accent)
@@ -144,14 +157,18 @@ async def run_learning_session(
                 console.print(Text(feedback, style="bold #f1fa8c"))
                 feedback = ""
 
-            key = (await async_read_key()).lower()
+            if reveal_audio:
+                reveal_audio = False
+                example = phrases[0] if config.auto_play_example and phrases else ""
+                if word_audio_timing == "answer":
+                    play_word_sound(word, accent, example=example)
+                elif example:
+                    audio_engine.speak_sentence(example, accent=accent)
+
+            key = await _read_command(console)
             if key == "q":
                 console.print(Text("\n[已退出学习]", style="dim #6272a4"))
                 return
-            elif key == "b":
-                audio_engine.stop()
-                trigger_boss(console)
-                await async_read_key()
             elif key == "h":
                 if not config.update(hide_judge_hint=not config.hide_judge_hint):
                     feedback = "无法保存提示栏设置。"
@@ -159,7 +176,8 @@ async def run_learning_session(
                 play_word_sound(word, accent)
             elif key == "t":
                 accent = "UK" if accent == "US" else "US"
-                play_word_sound(word, accent)
+                if answered:
+                    play_word_sound(word, accent)
                 for phrase in phrases:
                     audio_engine.prefetch_sentence(phrase, accent=accent)
             elif key == "m":
@@ -185,13 +203,15 @@ async def run_learning_session(
                     judge_start = time.monotonic()
                 else:
                     recall_start = time.monotonic()
-            elif not answered and key in (" ", "\r", "\n"):
-                judge_start = time.monotonic()
-                recall_ms = int((judge_start - recall_start) * 1000)
-                if config.auto_play_example and phrases:
-                    audio_engine.speak_sentence(phrases[0], accent=accent)
-            elif answered and key in ("e", "4", "5", "6"):
-                index = 0 if key == "e" else int(key) - 4
+            elif key in (" ", "\r", "\n"):
+                if answered:
+                    play_word_sound(word, accent)
+                else:
+                    judge_start = time.monotonic()
+                    recall_ms = int((judge_start - recall_start) * 1000)
+                    reveal_audio = True
+            elif answered and (key == "e" or key in EXAMPLE_KEYS):
+                index = 0 if key == "e" else EXAMPLE_KEYS.index(key)
                 if index < len(phrases):
                     audio_engine.speak_sentence(phrases[index], accent=accent)
             elif answered and key in JUDGMENTS:
@@ -233,7 +253,10 @@ def _render_menu(
     if config.hide_judge_hint:
         console.print(Text("  [y] 开始背词  [s] 设置  [h] 显示提示  [q] 退出", style="dim #6272a4"))
     else:
-        console.print(Text("  [y] 开始背词  [r] 提前复习  [/] 查词典  [s] 设置  [m] 切换模式  [h] 隐藏提示  [q] 退出", style="bold #00f0ff"))
+        console.print(Text(
+            "  [y] 开始背词  [r] 提前复习  [/] 查词典  [s] 设置  [m] 切换模式  [h] 隐藏提示  [Esc/b] 老板键  [q] 退出",
+            style="bold #00f0ff",
+        ))
 
 
 async def _connect(client: MorrowClient, console: Console) -> None:
@@ -265,7 +288,7 @@ async def _run(console: Console, config: Config) -> None:
                 rest_auth_failed=bool(client and client.rest_auth_failed),
             )
             message = ""
-            key = (await async_read_key()).lower()
+            key = await _read_command(console)
             if key == "q":
                 return
             if key == "/":
