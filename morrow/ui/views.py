@@ -183,3 +183,189 @@ def show_completion_screen(console: Console, stats: Dict[str, Any], streak: int 
     console.print(panel)
     console.print()
     console.print(Text("  [r] 提前复习(再来一批)   [/] 查词典   [q] 退出程序", style="bold #8be9fd"))
+
+
+# ============================================================================
+# 智能 Token 引导与配置向导
+# ============================================================================
+
+def show_token_wizard(console: Console, config, reason: str = "missing") -> bool:
+    console.clear()
+    
+    title_text = "✦ MORROW TOKEN 配置与授权向导 ✦"
+    if reason == "expired":
+        sub_text = "[bold #ff5555]检测到当前 ws_token 已失效或过期，需要更新才能继续连接墨墨。[/bold #ff5555]"
+    elif reason == "missing":
+        sub_text = "[bold #f1fa8c]检测到尚未配置核心背词凭证 (ws_token)。[/bold #f1fa8c]"
+    else:
+        sub_text = "[bold #00f0ff]更新与维护你的墨墨授权 Token。[/bold #00f0ff]"
+
+    guide_text = Text()
+    guide_text.append(f"{sub_text}\n\n", style="bold")
+    guide_text.append("【如何快速获取 ws_token (背词核心凭证)】：\n", style="bold #00f0ff")
+    guide_text.append("  1. 浏览器打开墨墨 Web 学习端：", style="#f8f8f2")
+    guide_text.append("https://tc-apis.maimemo.com/webstudy/\n", style="underline #8be9fd")
+    guide_text.append("  2. 登录账号后，在键盘按下 ", style="#f8f8f2")
+    guide_text.append("F12", style="bold #50fa7b")
+    guide_text.append(" 打开开发者工具 -> 切换到【网络 / Network】标签页。\n", style="#f8f8f2")
+    guide_text.append("  3. 筛选【WS】或【WebSockets】，找到 ", style="#f8f8f2")
+    guide_text.append("webstudy", style="bold #50fa7b")
+    guide_text.append(" 连接。\n", style="#f8f8f2")
+    guide_text.append("  4. 点击该连接，复制请求 URL 中 ", style="#f8f8f2")
+    guide_text.append("?token=", style="bold #50fa7b")
+    guide_text.append(" 后面的长串字符串即可。\n\n", style="#f8f8f2")
+
+    panel = Panel(
+        guide_text,
+        title=f"[bold #00f0ff]{title_text}[/bold #00f0ff]",
+        box=MODAL_BOX,
+        border_style="#00f0ff",
+        padding=(1, 2)
+    )
+    console.print(panel)
+    console.print()
+
+    # 1. 询问是否自动打开浏览器
+    open_browser = Prompt.ask("  是否自动在默认浏览器中打开墨墨登录网页？", choices=["y", "n"], default="y")
+    if open_browser.lower() == "y":
+        try:
+            import webbrowser
+            webbrowser.open("https://tc-apis.maimemo.com/webstudy/")
+            console.print(Text("  [已打开浏览器] 请在登录后按 F12 复制 ws_token\n", style="dim #50fa7b"))
+        except Exception:
+            pass
+
+    # 2. 输入 ws_token
+    while True:
+        token_input = Prompt.ask("  👉 请粘贴你的 ws_token (直接按回车取消)").strip()
+        if not token_input:
+            if config.ws_token:
+                break
+            else:
+                return False
+
+        # 即时测试连通性
+        console.print(Text("  正在验证 token 有效性 ...", style="dim #6272a4"))
+        try:
+            from ..client import MorrowClient
+            import asyncio
+            async def _check(tok):
+                c = MorrowClient(tok)
+                ok = await c.connect()
+                if ok:
+                    await c.close()
+                return ok, c.last_error
+
+            is_valid, err = asyncio.run(_check(token_input))
+            if is_valid:
+                config.set("ws_token", token_input)
+                config.save()
+                console.print(Text("  [验证成功] ✓ ws_token 有效并已保存至 config.json！\n", style="bold #50fa7b"))
+                break
+            else:
+                console.print(Text(f"  [验证失败] 无法连通服务端 ({err})，请确认 token 完整性后重新粘贴。", style="bold #ff5555"))
+        except Exception:
+            config.set("ws_token", token_input)
+            config.save()
+            console.print(Text("  [已保存] 已写入 config.json！\n", style="bold #50fa7b"))
+            break
+
+    # 3. 询问 rest_token (可选)
+    curr_rest = config.rest_token
+    mask_rest = (curr_rest[:6] + "..." + curr_rest[-4:]) if len(curr_rest) > 10 else ("已设置" if curr_rest else "未设置")
+    console.print(Text(f"  当前 rest_token 状态: [{mask_rest}]", style="dim #bd93f9"))
+    console.print(Text("  (rest_token 来自墨墨手机 App -> 更多设置 -> 实验功能 -> 开放 API，用于同步连续打卡天数)", style="dim #6272a4"))
+    rest_input = Prompt.ask("  👉 请输入 rest_token (留空保持原样 / 跳过)", default="").strip()
+    if rest_input:
+        config.set("rest_token", rest_input)
+        config.save()
+        console.print(Text("  [已保存] rest_token 已更新！", style="bold #50fa7b"))
+
+    time.sleep(1)
+    return True
+
+
+# ============================================================================
+# CUI 设置与 Token 管理面板 (s)
+# ============================================================================
+
+def show_settings_modal(console: Console, config) -> None:
+    while True:
+        console.clear()
+        
+        ws_tok = config.ws_token
+        ws_mask = (ws_tok[:6] + "..." + ws_tok[-4:]) if len(ws_tok) > 10 else ("已设置" if ws_tok else "未设置 [需配置]")
+        
+        rest_tok = config.rest_token
+        rest_mask = (rest_tok[:6] + "..." + rest_tok[-4:]) if len(rest_tok) > 10 else ("已设置" if rest_tok else "未设置 [可选]")
+
+        t = Table(show_header=False, box=ROUNDED, border_style="#00f0ff", padding=(0, 2))
+        t.add_column("选项", style="bold #00f0ff", width=6)
+        t.add_column("设置项", style="bold #f8f8f2", width=26)
+        t.add_column("当前状态/值", style="#50fa7b")
+
+        t.add_row("[1]", "背词核心凭证 (ws_token)", ws_mask)
+        t.add_row("[2]", "打卡统计凭证 (rest_token)", rest_mask)
+        t.add_row("[3]", "浏览器打开墨墨 Web 登录页", "https://tc-apis.maimemo.com/webstudy/")
+        t.add_row("[4]", "发音偏好 (美音 / 英音)", config.accent)
+        t.add_row("[5]", "单词发音自动播放", "开启" if config.auto_play_audio else "关闭")
+        t.add_row("[6]", "例句发音自动朗读", "开启" if config.auto_play_example else "关闭")
+        t.add_row("[7]", "启动 Token 完整配置向导", "交互式检测与输入")
+
+        panel = Panel(
+            t,
+            title="[bold #00f0ff]✦ MORROW 系统与凭证设置 ✦[/bold #00f0ff]",
+            box=CARD_BOX,
+            border_style="#00f0ff",
+            padding=(1, 2)
+        )
+        console.print(panel)
+        console.print()
+        console.print(Text("  输入选项序号 [1-7] 进行设置，直接按回车或 [q] 返回主菜单", style="dim #6272a4"))
+        
+        choice = Prompt.ask("  👉 请选择操作", default="").strip().lower()
+        if not choice or choice in ("q", "quit", "exit"):
+            break
+        elif choice == "1":
+            val = Prompt.ask("  请输入新的 ws_token").strip()
+            if val:
+                config.set("ws_token", val)
+                config.save()
+                console.print(Text("  [成功] ws_token 已更新！", style="bold #50fa7b"))
+                time.sleep(1)
+        elif choice == "2":
+            val = Prompt.ask("  请输入新的 rest_token").strip()
+            if val:
+                config.set("rest_token", val)
+                config.save()
+                console.print(Text("  [成功] rest_token 已更新！", style="bold #50fa7b"))
+                time.sleep(1)
+        elif choice == "3":
+            try:
+                import webbrowser
+                webbrowser.open("https://tc-apis.maimemo.com/webstudy/")
+                console.print(Text("  [已打开浏览器] 墨墨网页端已启动", style="bold #50fa7b"))
+            except Exception:
+                pass
+            time.sleep(1)
+        elif choice == "4":
+            new_acc = "UK" if config.accent == "US" else "US"
+            config.set("accent", new_acc)
+            config.save()
+            console.print(Text(f"  [成功] 发音偏好已切换为: {new_acc}", style="bold #50fa7b"))
+            time.sleep(1)
+        elif choice == "5":
+            new_val = not config.auto_play_audio
+            config.set("auto_play_audio", new_val)
+            config.save()
+            console.print(Text(f"  [成功] 单词自动播放已切换为: {'开启' if new_val else '关闭'}", style="bold #50fa7b"))
+            time.sleep(1)
+        elif choice == "6":
+            new_val = not config.auto_play_example
+            config.set("auto_play_example", new_val)
+            config.save()
+            console.print(Text(f"  [成功] 例句自动播放已切换为: {'开启' if new_val else '关闭'}", style="bold #50fa7b"))
+            time.sleep(1)
+        elif choice == "7":
+            show_token_wizard(console, config, reason="manual")
+            break

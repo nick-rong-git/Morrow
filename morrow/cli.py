@@ -26,7 +26,9 @@ from .ui import (
     trigger_boss,
     show_dictionary_modal,
     show_advance_review_modal,
-    show_completion_screen
+    show_completion_screen,
+    show_token_wizard,
+    show_settings_modal
 )
 
 # ============================================================================
@@ -296,31 +298,43 @@ def main():
     console = Console()
     config = Config("config.json")
 
+    # 若未配置核心凭证，主动唤起交互式向导
     if not config.ws_token:
-        console.print(Panel(
-            "[bold red]错误：尚未配置 ws_token！[/bold red]\n"
-            "请在 [bold #00f0ff]config.json[/bold #00f0ff] 中填入您的墨墨 token 后再启动。",
-            box=CARD_BOX,
-            border_style="red"
-        ))
-        return
+        wizard_ok = show_token_wizard(console, config, reason="missing")
+        if not wizard_ok or not config.ws_token:
+            console.print(Text("\n  [提示] 尚未配置 ws_token，已退出。", style="dim #6272a4"))
+            return
 
     render_banner(console)
 
     async def _async_start():
-        client = MorrowClient(ws_token=config.ws_token, rest_token=config.rest_token)
-        console.print(Text("  正在建立安全长连接并同步学习进度 ...", style="dim #6272a4"))
-        
-        ok = await client.connect()
-        if not ok:
-            console.print(Text(f"  [连接失败] {client.last_error}", style="bold red"))
-            return
+        while True:
+            client = MorrowClient(ws_token=config.ws_token, rest_token=config.rest_token)
+            console.print(Text("  正在建立安全长连接并同步学习进度 ...", style="dim #6272a4"))
+            
+            ok = await client.connect()
+            if not ok:
+                console.print(Text(f"  [连接失败] {client.last_error}", style="bold red"))
+                console.print(Text("  检测到 Token 可能已失效或过期。", style="bold #f1fa8c"))
+                retry = Prompt.ask("  是否立即启动 Token 向导重新获取并输入？", choices=["y", "n"], default="y")
+                if retry.lower() == "y":
+                    show_token_wizard(console, config, reason="expired")
+                    continue
+                else:
+                    return
 
-        init_ok = await client.initialize()
-        if not init_ok:
-            console.print(Text("  [握手失败] 无法初始化墨墨学习会话", style="bold red"))
-            await client.close()
-            return
+            init_ok = await client.initialize()
+            if not init_ok:
+                console.print(Text("  [握手失败] 无法初始化墨墨学习会话", style="bold red"))
+                retry = Prompt.ask("  是否重新配置 Token？", choices=["y", "n"], default="y")
+                if retry.lower() == "y":
+                    await client.close()
+                    show_token_wizard(console, config, reason="expired")
+                    continue
+                else:
+                    await client.close()
+                    return
+            break
 
         streak_info = client.fetch_user_streak()
         streak = streak_info.get("streak", 1)
@@ -332,9 +346,9 @@ def main():
             console.print(Text(f"  🔥 墨墨已连续打卡: {streak} 天  │  界面模式: [{config.ui_mode}]  │  默认发音: [{config.accent}]", style="bold #50fa7b"))
             console.print()
             if not config.hide_judge_hint:
-                console.print(Text("  按 [y] 开始背词   [r] 提前复习   [/] 查词典   [m] 切伪装模式   [h] 隐藏提示   [q] 退出", style="bold #00f0ff"))
+                console.print(Text("  按 [y] 开始背词   [r] 提前复习   [/] 查词典   [s] 设置/Token   [m] 切伪装模式   [h] 隐藏提示   [q] 退出", style="bold #00f0ff"))
             else:
-                console.print(Text("  按 [y] 开始背词  │  [h] 显示提示", style="dim #6272a4"))
+                console.print(Text("  按 [y] 开始背词  │  [s] 设置  │  [h] 显示提示", style="dim #6272a4"))
 
         _render_menu()
 
@@ -351,6 +365,9 @@ def main():
                     break
             elif kl == "/":
                 show_dictionary_modal(console)
+                _render_menu()
+            elif kl == "s":
+                show_settings_modal(console, config)
                 _render_menu()
             elif kl == "h":
                 config.set("hide_judge_hint", not config.hide_judge_hint)

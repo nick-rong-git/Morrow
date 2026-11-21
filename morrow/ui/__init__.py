@@ -14,5 +14,7 @@ from .views import (
     trigger_boss,
     show_dictionary_modal,
     show_advance_review_modal,
-    show_completion_screen
+    show_completion_screen,
+    show_token_wizard,
+    show_settings_modal
 )
