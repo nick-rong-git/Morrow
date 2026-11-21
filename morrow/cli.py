@@ -13,6 +13,7 @@ from rich.text import Text
 from .audio import audio_engine
 from .client import MorrowClient
 from .config import Config
+from .terminal import terminal_session
 from .ui import (
     EXAMPLE_KEYS,
     get_study_examples,
@@ -333,15 +334,15 @@ async def _run(console: Console, config: Config) -> None:
 
 
 def main() -> None:
-    console = Console()
     config = Config(Path(__file__).resolve().parent.parent / "config.json")
     audio_engine.cache_dir = config.config_path.parent / config.data_dir / "audio_cache"
-    try:
-        asyncio.run(_run(console, config))
-    except KeyboardInterrupt:
-        console.print(Text("\n[已中断退出]", style="dim #6272a4"))
-    except EOFError:
-        pass
+    with terminal_session() as console:
+        try:
+            asyncio.run(_run(console, config))
+        except KeyboardInterrupt:
+            console.print(Text("\n[已中断退出]", style="dim #6272a4"))
+        except EOFError:
+            pass
 
 
 if __name__ == "__main__":
