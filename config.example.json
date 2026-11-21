@@ -1,0 +1,11 @@
+{
+    "ws_token": "YOUR_MAIMEMO_WS_TOKEN_HERE",
+    "rest_token": "YOUR_MAIMEMO_REST_TOKEN_HERE",
+    "ui_mode": "study",
+    "auto_play_audio": true,
+    "auto_play_example": false,
+    "accent": "US",
+    "data_dir": "data",
+    "record_enabled": true,
+    "hide_judge_hint": false
+}
