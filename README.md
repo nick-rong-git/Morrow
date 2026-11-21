@@ -51,8 +51,21 @@ Morrow 是一款专为极客与开发者打造的高质感终端（CUI）背单�
 
 ## 🚀 启动方式
 
-- **Windows 用户**：双击根目录下的 `start_morrow.bat` 即可启动。
+- 需要 Python 3.10 或更新版本。Windows 首次使用时，在项目目录运行：
+  ```powershell
+  py -3 -m pip install -r requirements.txt
+  ```
+- **Windows 用户**：双击根目录下的 `start_morrow.bat`。脚本优先使用项目里的 `.venv`，随后尝试 `py -3` 和 `python`。
 - **命令行方式**：
   ```bash
   python morrow.py
   ```
+- 首页按 `s` → `1` → 回车，从 Edge 或 Chrome 登录墨墨并进入学习页。Morrow 会验证并保存背词凭证，然后关闭这次打开的窗口。
+- 手动配置时，按 `s` → `7` 粘贴背词 WebSocket 的完整请求地址或 `ws_token`。
+- 可选的开放 API 凭证 `rest_token` 用于在首页显示墨墨今日学习进度。按 `s` → `2` 可打开官方凭证页。
+
+## 回归测试
+
+```bash
+python -m unittest discover -s tests -v
+```

@@ -3,8 +3,10 @@ Morrow 模态弹窗与特色视图 (Views)
 包含即时查词典、老板键伪装、提前复习加词、今日通关大捷等交互界面。
 """
 
-import time
+import asyncio
+import webbrowser
 from typing import Dict, Any
+from rich.box import DOUBLE_EDGE
 from rich.console import Console
 from rich.text import Text
 from rich.panel import Panel
@@ -12,13 +14,17 @@ from rich.table import Table
 from rich.align import Align
 from rich.prompt import Prompt
 
-from .theme import (
-    COLOR_PRIMARY, COLOR_SECONDARY, COLOR_SUCCESS,
-    COLOR_WARNING, COLOR_DANGER, COLOR_MUTED, COLOR_TEXT_MAIN,
-    CARD_BOX, MODAL_BOX
-)
+from .theme import CARD_BOX, MODAL_BOX
+from ..client import MorrowClient
 from ..dict import lookup_dictionary
 from ..audio import audio_engine
+from ..web_login import (
+    OPEN_API_TOKEN_URL, WEB_STUDY_URL, WebLoginError, sign_in_via_browser, token_from_study_url,
+)
+
+
+async def _ask(console: Console, prompt: str, **options) -> str:
+    return await asyncio.to_thread(Prompt.ask, prompt, console=console, **options)
 
 # ============================================================================
 # 老板键一键救急屏
@@ -66,14 +72,14 @@ def trigger_boss(console: Console) -> None:
 # 终端即时查词典弹窗 (/)
 # ============================================================================
 
-def show_dictionary_modal(console: Console) -> None:
+async def show_dictionary_modal(console: Console) -> None:
     console.print()
-    word_input = Prompt.ask("  [bold #00f0ff]🔍 请输入要查询的单词[/bold #00f0ff] (直接按回车取消)").strip()
+    word_input = (await _ask(console, "  [bold #00f0ff]🔍 请输入要查询的单词[/bold #00f0ff] (直接按回车取消)")).strip()
     if not word_input:
         return
 
     console.print(Text(f"  正在联网检索 \"{word_input}\" ...", style="dim #6272a4"))
-    res = lookup_dictionary(word_input)
+    res = await asyncio.to_thread(lookup_dictionary, word_input)
 
     content = Table.grid(padding=(0, 1))
     content.add_column()
@@ -97,6 +103,9 @@ def show_dictionary_modal(console: Console) -> None:
             content.add_row(Text(f"  • {d}", style="dim #f8f8f2"))
         content.add_row(Text(" "))
 
+    if not res.get("explains") and not res.get("definitions"):
+        content.add_row(Text("  暂无释义。请检查拼写或稍后重试。", style="dim"))
+
     panel = Panel(
         content,
         title="[bold #00f0ff]✦ MORROW DICTIONARY ✦[/bold #00f0ff]",
@@ -111,7 +120,7 @@ def show_dictionary_modal(console: Console) -> None:
     if res.get("audio_url"):
         audio_engine.play_word(res["audio_url"], async_play=True)
 
-    Prompt.ask("\n  [dim]按回车键返回单词背诵[/dim]")
+    await _ask(console, "\n  [dim]按回车键返回[/dim]", default="", show_default=False)
 
 
 # ============================================================================
@@ -129,19 +138,25 @@ async def show_advance_review_modal(console: Console, client) -> int:
         box=CARD_BOX,
         border_style="#8be9fd"
     ))
-    ans = Prompt.ask("  请输入欲添加的复习单词数量 (推荐 5 / 10 / 20，直接回车取消)", default="").strip()
-    if not ans or not ans.isdigit() or int(ans) <= 0:
-        return 0
+    while True:
+        ans = (await _ask(console, "  请输入要添加的复习单词数量 (推荐 5 / 10 / 20，直接回车取消)", default="", show_default=False)).strip()
+        if not ans:
+            return 0
+        if len(ans) <= 10 and ans.isdecimal() and 0 < int(ans) <= 2**31 - 1:
+            count = int(ans)
+            break
+        console.print(Text("  请输入有效的正整数。", style="bold #f1fa8c"))
 
-    count = int(ans)
-    console.print(Text(f"  正在请求服务端舀入 {count} 个单词 ...", style="dim #6272a4"))
+    console.print(Text(f"  正在请求服务端追加 {count} 个单词 …", style="dim #6272a4"))
     added = await client.add_words(count)
-    if added is not None and added > 0:
+    if added is None:
+        console.print(Text(f"  加词失败。{client.last_error}", style="bold #f1fa8c"))
+    elif added > 0:
         console.print(Text(f"  [成功] 已成功向今日队列追加 {added} 个复习单词！", style="bold #50fa7b"))
     else:
-        console.print(Text("  [提示] 未能追加新词（可能当前词本已学完或网络超时）", style="bold #f1fa8c"))
+        console.print(Text("  当前没有可追加的复习单词。", style="bold #f1fa8c"))
 
-    time.sleep(1.2)
+    await asyncio.sleep(1.2)
     return added or 0
 
 
@@ -149,7 +164,7 @@ async def show_advance_review_modal(console: Console, client) -> int:
 # 今日任务通关胜利屏
 # ============================================================================
 
-def show_completion_screen(console: Console, stats: Dict[str, Any], streak: int = 1) -> None:
+def show_completion_screen(console: Console, stats: Dict[str, Any], streak: int | None = None) -> None:
     console.clear()
     learned = stats.get("total", 0)
     known = stats.get("known", 0)
@@ -157,7 +172,8 @@ def show_completion_screen(console: Console, stats: Dict[str, Any], streak: int 
     forgot = stats.get("forgot", 0)
     mastered = stats.get("mastered", 0)
 
-    accuracy = int(known * 100 / max(1, (known + fuzzy + forgot)))
+    judged = known + fuzzy + forgot
+    accuracy = f"{known * 100 // judged}%" if judged else "暂无"
 
     t = Text()
     t.append("\n  🏆  CONGRATULATIONS!  🏆\n", style="bold #feca57")
@@ -168,10 +184,10 @@ def show_completion_screen(console: Console, stats: Dict[str, Any], streak: int 
     t.append(f"     • 一次性直接认识  : {known}\n", style="#50fa7b")
     t.append(f"     • 遗忘与模糊强化  : {fuzzy + forgot}\n", style="#ff5555")
     t.append(f"     • 斩词/熟知永久剔除: {mastered}\n", style="#bd93f9")
-    t.append(f"     • 本轮认识准确率  : {accuracy}%\n\n", style="bold #f1fa8c")
+    t.append(f"     • 本轮认识准确率  : {accuracy}\n\n", style="bold #f1fa8c")
 
-    t.append("  🔥 连续打卡荣耀：\n", style="bold #ff9f43")
-    t.append(f"     墨墨连续打卡已达成 {streak} 天！明天的自己会感谢今天的坚持！\n\n", style="bold #feca57")
+    if streak is not None:
+        t.append(f"  🔥 墨墨已连续打卡 {streak} 天\n", style="bold #feca57")
 
     panel = Panel(
         Align.center(t),
@@ -189,183 +205,127 @@ def show_completion_screen(console: Console, stats: Dict[str, Any], streak: int 
 # 智能 Token 引导与配置向导
 # ============================================================================
 
-def show_token_wizard(console: Console, config, reason: str = "missing") -> bool:
-    console.clear()
-    
-    title_text = "✦ MORROW TOKEN 配置与授权向导 ✦"
-    if reason == "expired":
-        sub_text = "[bold #ff5555]检测到当前 ws_token 已失效或过期，需要更新才能继续连接墨墨。[/bold #ff5555]"
-    elif reason == "missing":
-        sub_text = "[bold #f1fa8c]检测到尚未配置核心背词凭证 (ws_token)。[/bold #f1fa8c]"
-    else:
-        sub_text = "[bold #00f0ff]更新与维护你的墨墨授权 Token。[/bold #00f0ff]"
+async def _open_in_browser(console: Console, url: str) -> None:
+    try:
+        opened = await asyncio.to_thread(webbrowser.open, url)
+    except (OSError, webbrowser.Error):
+        opened = False
+    if not opened:
+        console.print(Text(f"  无法打开浏览器，请手动打开 {url}", style="bold #f1fa8c"))
 
-    guide_text = Text()
-    guide_text.append(f"{sub_text}\n\n", style="bold")
-    guide_text.append("【如何快速获取 ws_token (背词核心凭证)】：\n", style="bold #00f0ff")
-    guide_text.append("  1. 浏览器打开墨墨 Web 学习端：", style="#f8f8f2")
-    guide_text.append("https://tc-apis.maimemo.com/webstudy/\n", style="underline #8be9fd")
-    guide_text.append("  2. 登录账号后，在键盘按下 ", style="#f8f8f2")
-    guide_text.append("F12", style="bold #50fa7b")
-    guide_text.append(" 打开开发者工具 -> 切换到【网络 / Network】标签页。\n", style="#f8f8f2")
-    guide_text.append("  3. 筛选【WS】或【WebSockets】，找到 ", style="#f8f8f2")
-    guide_text.append("webstudy", style="bold #50fa7b")
-    guide_text.append(" 连接。\n", style="#f8f8f2")
-    guide_text.append("  4. 点击该连接，复制请求 URL 中 ", style="#f8f8f2")
-    guide_text.append("?token=", style="bold #50fa7b")
-    guide_text.append(" 后面的长串字符串即可。\n\n", style="#f8f8f2")
 
-    panel = Panel(
-        guide_text,
-        title=f"[bold #00f0ff]{title_text}[/bold #00f0ff]",
-        box=MODAL_BOX,
-        border_style="#00f0ff",
-        padding=(1, 2)
-    )
-    console.print(panel)
-    console.print()
+async def _save_ws_token(console: Console, config, token: str) -> bool:
+    console.print(Text("  正在验证 ws_token …", style="dim #6272a4"))
+    client = MorrowClient(token)
+    try:
+        if not await client.connect() or not await client.initialize():
+            console.print(Text(f"  验证失败。{client.last_error}", style="bold #ff5555"))
+            return False
+    finally:
+        await client.close()
+    if config.update(ws_token=token):
+        console.print(Text("  ws_token 已验证并保存。", style="bold #50fa7b"))
+        return True
+    return False
 
-    # 1. 询问是否自动打开浏览器
-    open_browser = Prompt.ask("  是否自动在默认浏览器中打开墨墨登录网页？", choices=["y", "n"], default="y")
-    if open_browser.lower() == "y":
-        try:
-            import webbrowser
-            webbrowser.open("https://tc-apis.maimemo.com/webstudy/")
-            console.print(Text("  [已打开浏览器] 请在登录后按 F12 复制 ws_token\n", style="dim #50fa7b"))
-        except Exception:
-            pass
 
-    # 2. 输入 ws_token
+async def _paste_ws_token(console: Console, config) -> bool:
+    console.print(Text(
+        "  手动配置时，在墨墨学习网页的 F12 → 网络 → WS 中复制 webstudy 请求的完整 URL。"
+        "\n  也可以直接粘贴 ws_token。",
+        style="dim #8be9fd",
+    ))
     while True:
-        token_input = Prompt.ask("  👉 请粘贴你的 ws_token (直接按回车取消)").strip()
-        if not token_input:
-            if config.ws_token:
-                break
-            else:
-                return False
+        value = (await _ask(console, "  粘贴学习连接地址或 ws_token（回车返回）", password=True)).strip()
+        if not value:
+            return False
+        token = value
+        if "://" in value or value.lower().startswith(("ws:", "wss:", "http:", "https:")):
+            token = token_from_study_url(value)
+            if not token:
+                console.print(Text("  请粘贴墨墨 webstudy 的 WebSocket 请求地址。", style="bold #f1fa8c"))
+                continue
+        if await _save_ws_token(console, config, token):
+            return True
 
-        # 即时测试连通性
-        console.print(Text("  正在验证 token 有效性 ...", style="dim #6272a4"))
+
+async def show_token_wizard(console: Console, config, reason: str = "missing") -> bool:
+    console.clear()
+    guide = Text()
+    if reason == "missing":
+        guide.append("尚未配置背词凭证。\n\n", style="bold #f1fa8c")
+    guide.append("1  在 Edge 或 Chrome 中登录墨墨，Morrow 自动验证并保存背词凭证。\n")
+    guide.append("2  手动粘贴学习连接地址或 ws_token。\n")
+    console.print(Panel(guide, title="MORROW · 背词登录", box=MODAL_BOX, border_style="#00f0ff"))
+    choice = await _ask(console, "  选择登录方式，q 返回", choices=["1", "2", "q"], default="1")
+    if choice == "q":
+        return False
+    if choice == "1":
+        console.print(Text("  正在打开独立浏览器窗口。请在墨墨网页完成登录并进入学习页。", style="dim #8be9fd"))
         try:
-            from ..client import MorrowClient
-            import asyncio
-            async def _check(tok):
-                c = MorrowClient(tok)
-                ok = await c.connect()
-                if ok:
-                    await c.close()
-                return ok, c.last_error
-
-            is_valid, err = asyncio.run(_check(token_input))
-            if is_valid:
-                config.set("ws_token", token_input)
-                config.save()
-                console.print(Text("  [验证成功] ✓ ws_token 有效并已保存至 config.json！\n", style="bold #50fa7b"))
-                break
-            else:
-                console.print(Text(f"  [验证失败] 无法连通服务端 ({err})，请确认 token 完整性后重新粘贴。", style="bold #ff5555"))
-        except Exception:
-            config.set("ws_token", token_input)
-            config.save()
-            console.print(Text("  [已保存] 已写入 config.json！\n", style="bold #50fa7b"))
-            break
-
-    # 3. 询问 rest_token (可选)
-    curr_rest = config.rest_token
-    mask_rest = (curr_rest[:6] + "..." + curr_rest[-4:]) if len(curr_rest) > 10 else ("已设置" if curr_rest else "未设置")
-    console.print(Text(f"  当前 rest_token 状态: [{mask_rest}]", style="dim #bd93f9"))
-    console.print(Text("  (rest_token 来自墨墨手机 App -> 更多设置 -> 实验功能 -> 开放 API，用于同步连续打卡天数)", style="dim #6272a4"))
-    rest_input = Prompt.ask("  👉 请输入 rest_token (留空保持原样 / 跳过)", default="").strip()
-    if rest_input:
-        config.set("rest_token", rest_input)
-        config.save()
-        console.print(Text("  [已保存] rest_token 已更新！", style="bold #50fa7b"))
-
-    time.sleep(1)
-    return True
+            token = await sign_in_via_browser()
+        except WebLoginError as exc:
+            console.print(Text(f"  {exc}", style="bold #f1fa8c"))
+        else:
+            if await _save_ws_token(console, config, token):
+                return True
+    return await _paste_ws_token(console, config)
 
 
-# ============================================================================
-# CUI 设置与 Token 管理面板 (s)
-# ============================================================================
-
-def show_settings_modal(console: Console, config) -> None:
+async def show_settings_modal(console: Console, config) -> None:
+    message = ""
     while True:
         console.clear()
-        
-        ws_tok = config.ws_token
-        ws_mask = (ws_tok[:6] + "..." + ws_tok[-4:]) if len(ws_tok) > 10 else ("已设置" if ws_tok else "未设置 [需配置]")
-        
-        rest_tok = config.rest_token
-        rest_mask = (rest_tok[:6] + "..." + rest_tok[-4:]) if len(rest_tok) > 10 else ("已设置" if rest_tok else "未设置 [可选]")
-
-        t = Table(show_header=False, box=ROUNDED, border_style="#00f0ff", padding=(0, 2))
+        t = Table(show_header=False, box=CARD_BOX, border_style="#00f0ff", padding=(0, 2))
         t.add_column("选项", style="bold #00f0ff", width=6)
         t.add_column("设置项", style="bold #f8f8f2", width=26)
         t.add_column("当前状态/值", style="#50fa7b")
 
-        t.add_row("[1]", "背词核心凭证 (ws_token)", ws_mask)
-        t.add_row("[2]", "打卡统计凭证 (rest_token)", rest_mask)
-        t.add_row("[3]", "浏览器打开墨墨 Web 登录页", "https://tc-apis.maimemo.com/webstudy/")
-        t.add_row("[4]", "发音偏好 (美音 / 英音)", config.accent)
-        t.add_row("[5]", "单词发音自动播放", "开启" if config.auto_play_audio else "关闭")
-        t.add_row("[6]", "例句发音自动朗读", "开启" if config.auto_play_example else "关闭")
-        t.add_row("[7]", "启动 Token 完整配置向导", "交互式检测与输入")
+        t.add_row(Text("[1]"), "网页登录 / 更新背词凭证", "已设置" if config.ws_token else "未设置")
+        t.add_row(Text("[2]"), "开放 API 凭证 (rest_token)", "已设置" if config.rest_token else "未设置")
+        t.add_row(Text("[3]"), "打开墨墨学习网页", WEB_STUDY_URL)
+        t.add_row(Text("[4]"), "发音偏好 (美音 / 英音)", config.accent)
+        t.add_row(Text("[5]"), "单词自动发音", "开启" if config.auto_play_audio else "关闭")
+        t.add_row(Text("[6]"), "例句自动朗读", "开启" if config.auto_play_example else "关闭")
+        t.add_row(Text("[7]"), "手动更新背词凭证", "粘贴 WebSocket 地址或 ws_token")
 
-        panel = Panel(
-            t,
-            title="[bold #00f0ff]✦ MORROW 系统与凭证设置 ✦[/bold #00f0ff]",
-            box=CARD_BOX,
-            border_style="#00f0ff",
-            padding=(1, 2)
-        )
-        console.print(panel)
-        console.print()
-        console.print(Text("  输入选项序号 [1-7] 进行设置，直接按回车或 [q] 返回主菜单", style="dim #6272a4"))
-        
-        choice = Prompt.ask("  👉 请选择操作", default="").strip().lower()
+        console.print(Panel(t, title="MORROW · 系统与凭证设置", box=CARD_BOX, border_style="#00f0ff"))
+        if message:
+            console.print(Text(message, style="bold #f1fa8c"))
+            message = ""
+
+        choice = (await _ask(console, "  输入选项 [1-7]（回车返回）", default="", show_default=False)).strip().lower()
         if not choice or choice in ("q", "quit", "exit"):
-            break
-        elif choice == "1":
-            val = Prompt.ask("  请输入新的 ws_token").strip()
-            if val:
-                config.set("ws_token", val)
-                config.save()
-                console.print(Text("  [成功] ws_token 已更新！", style="bold #50fa7b"))
-                time.sleep(1)
-        elif choice == "2":
-            val = Prompt.ask("  请输入新的 rest_token").strip()
-            if val:
-                config.set("rest_token", val)
-                config.save()
-                console.print(Text("  [成功] rest_token 已更新！", style="bold #50fa7b"))
-                time.sleep(1)
-        elif choice == "3":
-            try:
-                import webbrowser
-                webbrowser.open("https://tc-apis.maimemo.com/webstudy/")
-                console.print(Text("  [已打开浏览器] 墨墨网页端已启动", style="bold #50fa7b"))
-            except Exception:
-                pass
-            time.sleep(1)
+            return
+        if choice == "7":
+            if await _paste_ws_token(console, config):
+                message = "背词凭证已更新。"
+            continue
+        if choice == "1":
+            if await show_token_wizard(console, config, reason="manual"):
+                message = "背词凭证已更新。"
+            continue
+        if choice == "3":
+            await _open_in_browser(console, WEB_STUDY_URL)
+            continue
+
+        if choice == "2":
+            if (await _ask(console, "  是否打开墨墨官方开放 API 凭证页？", choices=["y", "n"], default="n")) == "y":
+                await _open_in_browser(console, OPEN_API_TOKEN_URL)
+            token = (await _ask(console, "  输入新的 rest_token（回车取消）", password=True)).strip()
+            if not token:
+                continue
+            if token_from_study_url(token):
+                message = "这是背词凭证地址。请用设置 1 或 7 配置。"
+                continue
+            saved = config.update(rest_token=token)
         elif choice == "4":
-            new_acc = "UK" if config.accent == "US" else "US"
-            config.set("accent", new_acc)
-            config.save()
-            console.print(Text(f"  [成功] 发音偏好已切换为: {new_acc}", style="bold #50fa7b"))
-            time.sleep(1)
+            saved = config.update(accent="UK" if config.accent == "US" else "US")
         elif choice == "5":
-            new_val = not config.auto_play_audio
-            config.set("auto_play_audio", new_val)
-            config.save()
-            console.print(Text(f"  [成功] 单词自动播放已切换为: {'开启' if new_val else '关闭'}", style="bold #50fa7b"))
-            time.sleep(1)
+            saved = config.update(auto_play_audio=not config.auto_play_audio)
         elif choice == "6":
-            new_val = not config.auto_play_example
-            config.set("auto_play_example", new_val)
-            config.save()
-            console.print(Text(f"  [成功] 例句自动播放已切换为: {'开启' if new_val else '关闭'}", style="bold #50fa7b"))
-            time.sleep(1)
-        elif choice == "7":
-            show_token_wizard(console, config, reason="manual")
-            break
+            saved = config.update(auto_play_example=not config.auto_play_example)
+        else:
+            message = "请输入 1 到 7。"
+            continue
+        message = "设置已保存。" if saved else "无法保存设置。"

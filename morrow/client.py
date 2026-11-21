@@ -5,22 +5,23 @@ Morrow 核心学习客户端 (Morrow Learning Client)
 
 from __future__ import annotations
 
-import os
 import ssl
 import time
 import json
 import asyncio
+import urllib.parse
 import urllib.request
 from typing import Optional, Dict, Any, List
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 # ---------------------------------------------------------------------------
 # 协议常量
 # ---------------------------------------------------------------------------
 
 WS_URL = "wss://tc-apis.maimemo.com/study/ws/webstudy"
-REST_USER_INFO_URL = "https://tc-apis.maimemo.com/api/v1/user/info"
+REST_PROGRESS_URL = "https://open.maimemo.com/open/api/v1/study/get_study_progress"
 
 EV_SYSTEM_READY = 1
 EV_SYSTEM_PING = 2
@@ -85,24 +86,26 @@ def _enc_bool(field: int, v: bool) -> bytes:
 
 def _dec_varint(buf: bytes, pos: int):
     result = 0
-    shift = 0
-    while pos < len(buf):
+    for shift in range(0, 70, 7):
+        if pos >= len(buf):
+            raise ValueError("Varint 截断")
         b = buf[pos]
         pos += 1
+        if shift == 63 and b > 1:
+            raise ValueError("Varint 溢出")
         result |= (b & 0x7F) << shift
         if not (b & 0x80):
-            break
-        shift += 7
-    return result, pos
+            return result, pos
+    raise ValueError("Varint 溢出")
 
 def _decode_message(buf: bytes) -> Dict[int, list]:
     out: Dict[int, list] = {}
     pos = 0
     while pos < len(buf):
         tag, pos = _dec_varint(buf, pos)
-        if tag == 0:
-            break
         field, wire = tag >> 3, tag & 7
+        if not 0 < field < (1 << 29):
+            raise ValueError("无效的 Protobuf 字段编号")
         if wire == 0:
             val, pos = _dec_varint(buf, pos)
         elif wire == 2:
@@ -116,7 +119,9 @@ def _decode_message(buf: bytes) -> Dict[int, list]:
             val = buf[pos:pos + 4]
             pos += 4
         else:
-            break
+            raise ValueError("不支持的 Protobuf 字段类型")
+        if pos > len(buf):
+            raise ValueError("Protobuf 字段截断")
         out.setdefault(field, []).append(val)
     return out
 
@@ -296,8 +301,6 @@ class MorrowClient:
         self.rest_token = rest_token.strip()
         self.ws = None
         self._ssl_ctx = ssl.create_default_context()
-        self._ssl_ctx.check_hostname = False
-        self._ssl_ctx.verify_mode = ssl.CERT_NONE
 
         self._connected = False
         self._msg_seq = 0
@@ -306,6 +309,7 @@ class MorrowClient:
         self._ready_event: Optional[asyncio.Event] = None
         self._last_word_received_at: Optional[float] = None
         self.last_next_word: Optional[Dict[str, Any]] = None
+        self.last_request_rejected = False
         self.last_error: str = ""
         self.progress: Dict[str, int] = {}
 
@@ -318,13 +322,25 @@ class MorrowClient:
         return self._connected and self.ws is not None
 
     async def connect(self) -> bool:
-        if self._connected and self.ws is not None:
+        if self.is_alive:
             return True
-        url = f"{WS_URL}?token={self.ws_token}"
+        if self.ws is not None:
+            await self.close()
+        if not self.ws_token:
+            self.last_error = "尚未配置 ws_token"
+            return False
+
+        query = urllib.parse.urlencode({"token": urllib.parse.unquote(self.ws_token)})
+        url = f"{WS_URL}?{query}"
+        self.last_error = ""
         try:
             self.ws = await websockets.connect(url, ssl=self._ssl_ctx)
         except Exception as e:
-            self.last_error = f"连接网关失败: {e}"
+            self.last_error = f"连接网关失败: {type(e).__name__}"
+            response = getattr(e, "response", None)
+            status = getattr(response, "status_code", None) or getattr(e, "status_code", None)
+            if status is not None:
+                self.last_error += f" (HTTP {status})"
             return False
 
         self._connected = True
@@ -334,30 +350,30 @@ class MorrowClient:
             await asyncio.wait_for(self._ready_event.wait(), timeout=10)
         except asyncio.TimeoutError:
             self.last_error = "等待 SYSTEM_READY 握手超时"
+        except asyncio.CancelledError:
             await self.close()
-            return False
-
-        self.last_error = ""
-        return True
+            raise
+        else:
+            if self.is_alive:
+                return True
+        await self.close()
+        return False
 
     async def close(self):
         self._connected = False
-        if self._recv_task and not self._recv_task.done():
-            self._recv_task.cancel()
+        recv_task, self._recv_task = self._recv_task, None
+        if recv_task and not recv_task.done():
+            recv_task.cancel()
             try:
-                await self._recv_task
-            except (asyncio.CancelledError, Exception):
+                await recv_task
+            except asyncio.CancelledError:
                 pass
-        if self.ws:
+        if self.ws is not None:
             try:
                 await self.ws.close()
             except Exception:
                 pass
         self.ws = None
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(ConnectionError("连接已关闭"))
-        self._pending.clear()
 
     async def _send_envelope(self, msg_id: str, event: int, data: bytes = b""):
         await self.ws.send(encode_envelope(msg_id, event, data))
@@ -370,28 +386,19 @@ class MorrowClient:
             + _enc_bytes(4, b"")
             + _enc_bool(5, True)
         )
-        try:
-            await self.ws.send(frame)
-        except Exception:
-            pass
+        await self.ws.send(frame)
 
     async def _recv_loop(self):
         try:
             while self._connected and self.ws is not None:
-                try:
-                    frame = await self.ws.recv()
-                except websockets.exceptions.ConnectionClosed as e:
-                    self._connected = False
-                    reason = (e.reason or "").strip()
-                    self.last_error = f"连接断开 (code={e.code}, reason={reason})"
-                    break
+                frame = await self.ws.recv()
                 if not isinstance(frame, (bytes, bytearray)):
                     continue
                 env = parse_envelope(bytes(frame))
                 event = env["event"]
                 reply_id = env["reply_id"]
 
-                if event == EV_SYSTEM_PING:
+                if event == EV_SYSTEM_PING and not reply_id:
                     await self._reply_ping(env["id"])
                     continue
                 if event == EV_SYSTEM_READY:
@@ -403,29 +410,53 @@ class MorrowClient:
                     if not fut.done():
                         fut.set_result(env)
         except asyncio.CancelledError:
-            pass
+            raise
+        except ConnectionClosed as e:
+            code = e.rcvd.code if e.rcvd else 1006
+            self.last_error = f"连接断开 (code={code})"
         except Exception as e:
-            self._connected = False
-            self.last_error = f"接收异常: {e}"
+            self.last_error = f"接收异常: {type(e).__name__}"
         finally:
             self._connected = False
+            if self._ready_event is not None:
+                self._ready_event.set()
             for fut in self._pending.values():
                 if not fut.done():
-                    fut.set_exception(ConnectionError("连接断开"))
+                    fut.set_result(None)
             self._pending.clear()
 
     async def _request(self, event: int, data: bytes = b"", timeout: float = 12) -> Optional[Dict[str, Any]]:
-        if not self._connected or self.ws is None:
+        self.last_request_rejected = False
+        if not self.is_alive:
+            self.last_error = self.last_error or "连接已断开"
             return None
+        name = EVENT_NAMES.get(event, event)
         msg_id = self._next_id()
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self._pending[msg_id] = fut
         try:
             await self._send_envelope(msg_id, event, data)
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except Exception as e:
-            self._pending.pop(msg_id, None)
+            env = await asyncio.wait_for(fut, timeout=timeout)
+            if env is None:
+                self.last_error = self.last_error or "连接已断开"
+            elif not env["success"]:
+                self.last_request_rejected = True
+                errors = repr(env["errors"])
+                for token in {self.ws_token, urllib.parse.unquote(self.ws_token), self.rest_token} - {""}:
+                    errors = errors.replace(token, "…")
+                self.last_error = f"服务端拒绝 {name}: {errors}" if env["errors"] else f"服务端拒绝 {name}"
+            else:
+                self.last_error = ""
+            return env
+        except asyncio.TimeoutError:
+            self.last_error = f"{name} 请求超时"
             return None
+        except Exception as e:
+            self.last_error = f"{name} 请求失败: {type(e).__name__}"
+            return None
+        finally:
+            self._pending.pop(msg_id, None)
+            fut.cancel()
 
     # 业务接口
     async def initialize(self) -> bool:
@@ -435,9 +466,13 @@ class MorrowClient:
     async def get_word(self, back: bool = False) -> Optional[Dict[str, Any]]:
         data = encode_get_word_request(back)
         env = await self._request(EV_WEBSTUDY_GET_WORD, data, timeout=10)
-        if env is None:
+        if env is None or not env["success"]:
             return None
-        result = parse_get_word_response(env.get("data", b""))
+        try:
+            result = parse_get_word_response(env["data"])
+        except ValueError:
+            self.last_error = "无法解析服务端的取词响应"
+            return None
         if result.get("id"):
             self._last_word_received_at = time.monotonic()
         if result.get("progress"):
@@ -452,16 +487,17 @@ class MorrowClient:
         study_duration: int = 2000,
         study_method: str = "STUDY_CN_EN",
     ) -> bool:
+        self.last_next_word = None
         MIN_DURATION_MS = 300
         recall_duration = max(recall_duration, MIN_DURATION_MS)
         study_duration = max(study_duration, MIN_DURATION_MS)
 
         if self._last_word_received_at is not None:
             elapsed_ms = int((time.monotonic() - self._last_word_received_at) * 1000)
-            budget_ms = max(0, elapsed_ms - 100)
+            budget_ms = elapsed_ms - 100
             total = recall_duration + study_duration
-            if total > budget_ms and total > 0:
-                ratio = budget_ms / total
+            if total > budget_ms:
+                ratio = max(0, budget_ms) / total
                 recall_duration = max(MIN_DURATION_MS, int(recall_duration * ratio))
                 study_duration = max(MIN_DURATION_MS, int(study_duration * ratio))
                 if recall_duration + study_duration > budget_ms:
@@ -477,17 +513,20 @@ class MorrowClient:
         )
         env = await self._request(EV_WEBSTUDY_SUBMIT_RESPONSE, data, timeout=10)
         if env is None:
-            self.last_error = "SUBMIT_RESPONSE 超时未收到响应"
             return False
-        if not env.get("success", True):
-            self.last_error = f"服务端拒绝 SUBMIT_RESPONSE: {env.get('errors')}"
-            self.last_next_word = None
+        if not env["success"]:
             return False
-        self.last_error = ""
 
-        body = _decode_message(env.get("data", b""))
-        next_bufs = _get_bytes_list(body, 1)
-        self.last_next_word = parse_get_word_response(next_bufs[0]) if next_bufs else None
+        try:
+            body = _decode_message(env["data"])
+            next_bufs = _get_bytes_list(body, 1)
+            self.last_next_word = parse_get_word_response(next_bufs[0]) if next_bufs else None
+        except ValueError:
+            # 判答已获确认。让调用方重新取词，避免重复提交。
+            self.last_error = "判答已保存，但无法解析下一张词卡"
+        else:
+            if self.last_next_word is None:
+                self.last_next_word = {}
         if self.last_next_word and self.last_next_word.get("id"):
             self._last_word_received_at = time.monotonic()
         if self.last_next_word and self.last_next_word.get("progress"):
@@ -497,30 +536,36 @@ class MorrowClient:
     async def add_words(self, count: int, mode: int = 2) -> Optional[int]:
         if count <= 0:
             return 0
+        if count > 2**31 - 1:
+            self.last_error = "复习数量超出允许范围"
+            return None
         data = encode_add_words_request(count, mode)
         env = await self._request(EV_WEBSTUDY_ADD_WORDS, data, timeout=15)
         if env is None or not env.get("success"):
             return None
-        f = _decode_message(env.get("data", b""))
-        return _get_int(f, 1)
+        try:
+            f = _decode_message(env["data"])
+            return _get_int(f, 1)
+        except ValueError:
+            self.last_error = "无法解析服务端的加词响应"
+            return None
 
-    def fetch_user_streak(self) -> Dict[str, Any]:
-        """通过 REST API 获取连续打卡天数与基础信息"""
+    def fetch_study_progress(self) -> Dict[str, int]:
+        """通过开放 API 获取今日学习进度。"""
         if not self.rest_token:
-            return {"streak": 1, "is_signed": False}
+            return {}
         try:
             req = urllib.request.Request(
-                REST_USER_INFO_URL,
-                headers={
-                    "Authorization": f"Bearer {self.rest_token}",
-                    "User-Agent": "Mozilla/5.0"
-                }
+                REST_PROGRESS_URL,
+                method="POST",
             )
+            req.add_unredirected_header("Authorization", f"Bearer {self.rest_token}")
             with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                user = data.get("data", {}).get("user", {})
-                streak = user.get("continuous_sign_days", 1)
-                is_signed = bool(user.get("today_signed", False))
-                return {"streak": streak, "is_signed": is_signed, "user": user}
-        except Exception:
-            return {"streak": 1, "is_signed": False}
+                result = json.load(resp)
+            progress = result["data"]["progress"]
+            finished, total = progress["finished"], progress["total"]
+            if result.get("success") and type(finished) is int and type(total) is int and 0 <= finished <= total:
+                return {"finished": finished, "total": total}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return {}

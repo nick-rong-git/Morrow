@@ -4,17 +4,12 @@ Morrow 基础 UI 组件库 (Components)
 """
 
 from rich.text import Text
-from rich.table import Table
-from rich.panel import Panel
-from rich.box import ROUNDED
-from .theme import (
-    COLOR_PRIMARY, COLOR_SECONDARY, COLOR_SUCCESS,
-    COLOR_WARNING, COLOR_DANGER, COLOR_MUTED, COLOR_TEXT_MAIN
-)
+from .theme import COLOR_PRIMARY, COLOR_MUTED, COLOR_TEXT_MAIN
 
-def render_progress_bar(current: int, total: int, streak: int = 1) -> Text:
+def render_progress_bar(current: int, total: int, streak: int | None = None) -> Text:
     """渲染优雅的 Unicode 渐变进度条"""
-    total = max(1, total)
+    if total <= 0:
+        return Text(" 📖 今日进度暂不可用", style=COLOR_MUTED)
     current = min(total, max(0, current))
     ratio = current / total
     bar_width = 24
@@ -30,11 +25,8 @@ def render_progress_bar(current: int, total: int, streak: int = 1) -> Text:
     t.append(f"{int(ratio * 100)}% ", style=f"bold {COLOR_TEXT_MAIN}")
     t.append(f"({current}/{total} 词, 剩余 {max(0, total - current)} 词)", style=COLOR_MUTED)
     
-    # 连续打卡火苗徽章
-    t.append("  │  ", style=COLOR_MUTED)
-    t.append("🔥 连击 ", style="bold #ff9f43")
-    t.append(f"{streak} ", style="bold #feca57")
-    t.append("天", style="bold #ff9f43")
+    if streak is not None:
+        t.append(f"  │  🔥 连击 {streak} 天", style="bold #ff9f43")
     return t
 
 def render_judge_hotkeys() -> Text:

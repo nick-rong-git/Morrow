@@ -6,7 +6,7 @@ Morrow 即时查词引擎 (Instant Dictionary Engine)
 import json
 import urllib.request
 import urllib.parse
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 _DICT_CACHE: Dict[str, Dict[str, Any]] = {}
 
@@ -17,34 +17,35 @@ def lookup_dictionary(word: str) -> Dict[str, Any]:
     if w in _DICT_CACHE:
         return _DICT_CACHE[w]
 
+    query = urllib.parse.quote(w, safe="")
     result: Dict[str, Any] = {
         "word": w,
         "phonetic": "",
         "explains": [],
         "web_trans": [],
         "definitions": [],
-        "audio_url": f"https://dict.youdao.com/dictvoice?audio={urllib.parse.quote(w)}&type=2"
+        "audio_url": f"https://dict.youdao.com/dictvoice?audio={query}&type=2"
     }
 
     # 1. 有道词典接口
     try:
-        url = f"https://dict.youdao.com/suggest?num=1&doctype=json&q={urllib.parse.quote(w)}"
+        url = f"https://dict.youdao.com/suggest?num=5&doctype=json&q={query}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=4) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             entries = data.get("data", {}).get("entries", [])
-            if entries:
-                first = entries[0]
-                exp = first.get("explain", "")
-                if exp:
+            for entry in entries:
+                exp = entry.get("explain")
+                if entry.get("entry", "").lower() == w and exp:
                     result["explains"].append(exp)
+                    break
     except Exception:
         pass
 
     # 2. 备用有道翻译
     if not result["explains"]:
         try:
-            url = f"https://fanyi.youdao.com/translate?&doctype=json&type=AUTO&i={urllib.parse.quote(w)}"
+            url = f"https://fanyi.youdao.com/translate?doctype=json&type=AUTO&i={query}"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=4) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -61,14 +62,15 @@ def lookup_dictionary(word: str) -> Dict[str, Any]:
 
     # 3. 权威英英词典 (dictionaryapi.dev)
     try:
-        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{urllib.parse.quote(w)}"
+        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{query}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=4) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             if isinstance(data, list) and data:
                 entry = data[0]
-                if not result["phonetic"]:
-                    result["phonetic"] = entry.get("phonetic", "")
+                result["phonetic"] = entry.get("phonetic") or next(
+                    (p["text"] for p in entry.get("phonetics", []) if p.get("text")), ""
+                )
                 meanings = entry.get("meanings", [])
                 for m in meanings[:2]:
                     part = m.get("partOfSpeech", "")
@@ -79,5 +81,6 @@ def lookup_dictionary(word: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    _DICT_CACHE[w] = result
+    if result["explains"] or result["definitions"]:
+        _DICT_CACHE[w] = result
     return result

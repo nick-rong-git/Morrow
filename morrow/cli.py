@@ -1,393 +1,318 @@
-"""
-Morrow 核心命令行控制与状态机循环 (Morrow CLI Core)
-"""
+"""Morrow 命令行入口与学习流程。"""
 
+import asyncio
 import os
+from pathlib import Path
 import sys
 import time
-import asyncio
-from typing import Dict, Any, Optional
+from typing import Any, Dict
 
 from rich.console import Console
 from rich.text import Text
-from rich.panel import Panel
-from rich.table import Table
-from rich.prompt import Prompt
 
-from .config import Config
 from .audio import audio_engine
 from .client import MorrowClient
+from .config import Config
 from .ui import (
     render_banner,
-    render_study_recall_card,
-    render_study_answer_card,
-    render_disguise_recall_panel,
     render_disguise_answer_panel,
-    trigger_boss,
-    show_dictionary_modal,
+    render_disguise_recall_panel,
+    render_study_answer_card,
+    render_study_recall_card,
     show_advance_review_modal,
     show_completion_screen,
+    show_dictionary_modal,
+    show_settings_modal,
     show_token_wizard,
-    show_settings_modal
+    trigger_boss,
 )
 
-# ============================================================================
-# 异步非阻塞单键监听 (Windows Native msvcrt)
-# ============================================================================
+JUDGMENTS = {
+    "1": ("FAMILIAR", "known"), "j": ("FAMILIAR", "known"),
+    "2": ("VAGUE", "fuzzy"), "k": ("VAGUE", "fuzzy"),
+    "3": ("FORGET", "forgot"), "l": ("FORGET", "forgot"),
+    "0": ("WELL_FAMILIAR", "mastered"), "z": ("WELL_FAMILIAR", "mastered"),
+}
 
-def _read_char_sync() -> str:
-    if sys.platform == "win32":
-        import msvcrt
-        ch = msvcrt.getwch()
-        if ch in ("\x00", "\xe0"):
-            msvcrt.getwch()  # 过滤方向键扩展码
-            return ""
-        return ch
-    else:
-        import tty
-        import termios
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            return sys.stdin.read(1)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+class StudyError(Exception):
+    """当前学习会话无法继续。"""
+
 
 async def async_read_key() -> str:
-    loop = asyncio.get_event_loop()
-    while True:
-        k = await loop.run_in_executor(None, _read_char_sync)
-        if k:
-            return k
+    if not sys.stdin.isatty():
+        key = await asyncio.to_thread(sys.stdin.read, 1)
+        if not key:
+            raise EOFError
+        return key
+
+    if sys.platform == "win32":
+        import msvcrt
+
+        while True:
+            if msvcrt.kbhit():
+                key = msvcrt.getwch()
+                if key in ("\x00", "\xe0"):
+                    msvcrt.getwch()
+                elif key == "\x03":
+                    raise KeyboardInterrupt
+                else:
+                    return key
+            await asyncio.sleep(0.025)
+
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    previous = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            if select.select([fd], [], [], 0)[0]:
+                key = os.read(fd, 1)
+                if not key or key == b"\x04":
+                    raise EOFError
+                if key == b"\x1b":
+                    # 消费方向键等终端转义序列，避免把序列里的数字当成判答键。
+                    while select.select([fd], [], [], 0.025)[0]:
+                        os.read(fd, 1)
+                else:
+                    return key.decode("ascii", errors="replace")
+            await asyncio.sleep(0.025)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
 def play_word_sound(word: Dict[str, Any], accent: str) -> None:
     speeches = word.get("speeches", {})
-    url = speeches.get(accent.upper()) or word.get("audio_us") or word.get("audio_uk")
-    if url:
-        audio_engine.play_word(url, async_play=True)
+    url = speeches.get(accent) or word.get(f"audio_{accent.lower()}") or word.get("audio_us") or word.get("audio_uk")
+    audio_engine.play_word(url or "", fallback_text=word.get("spelling", ""), accent=accent)
 
 
-# ============================================================================
-# 学习循环控制器
-# ============================================================================
-
-async def run_learning_session(client: MorrowClient, config: Config, console: Console) -> None:
-    streak_info = client.fetch_user_streak()
-    streak = streak_info.get("streak", 1)
-
-    # 取首词
+async def _get_word(client: MorrowClient) -> Dict[str, Any]:
     word = await client.get_word()
-    if not word or not word.get("id"):
-        # 队列已学完，直接进入通关/提前复习屏
-        stats = {"total": 0, "known": 0, "fuzzy": 0, "forgot": 0, "mastered": 0}
-        show_completion_screen(console, stats, streak)
-        while True:
-            k = await async_read_key()
-            kl = k.lower()
-            if kl == "q":
-                return
-            if kl == "r":
-                added = await show_advance_review_modal(console, client)
-                if added > 0:
-                    word = await client.get_word()
-                    if word and word.get("id"):
-                        break
-            if kl == "/":
-                show_dictionary_modal(console)
-                show_completion_screen(console, stats, streak)
+    if word is None:
+        raise StudyError(client.last_error or "无法取词")
+    return word
 
-    # 学习状态统计
+
+async def run_learning_session(
+    client: MorrowClient, config: Config, console: Console,
+) -> None:
     stats = {"total": 0, "known": 0, "fuzzy": 0, "forgot": 0, "mastered": 0}
+    history = []
     accent = config.accent
     ui_mode = config.ui_mode
+    word = await _get_word(client)
 
-    while word and word.get("id"):
-        # 获取权威进度
-        srv_finished = client.progress.get("finished", 0)
-        srv_total = client.progress.get("total", 0) or 1
-        current_idx = srv_finished + 1
-
-        # 1. 播放单词真人发音
-        if config.auto_play_audio:
-            play_word_sound(word, accent)
-
-        # 2. 静默预取例句的高保真神经 MP3，消除用户按键延迟
-        phrases = word.get("phrases", [])
-        if phrases:
-            for p in phrases:
-                p_en = p.get("en", "")
-                if p_en:
-                    audio_engine.prefetch_sentence(p_en, accent=accent)
-
-        # ================= 第一屏：看词回忆阶段 =================
-        recall_start = time.monotonic()
-        skip_to_answer = False
-
-        while True:
-            if ui_mode == "study":
-                render_study_recall_card(console, word, current_idx, srv_total, streak, accent, config.hide_judge_hint)
-            else:
-                render_disguise_recall_panel(console, word, current_idx, srv_total)
-
-            k = await async_read_key()
-            kl = k.lower()
-
-            if kl == "q":
-                console.print(Text("\n[已安全退出学习]", style="dim #6272a4"))
+    while True:
+        if not word.get("id"):
+            audio_engine.stop()
+            show_completion_screen(console, stats)
+            key = (await async_read_key()).lower()
+            if key == "q":
                 return
-            if kl == "b":
-                trigger_boss(console)
-                await async_read_key()
-                continue
-            if kl == "h":
-                config.set("hide_judge_hint", not config.hide_judge_hint)
-                config.save()
-                continue
-            if kl == "p":
-                play_word_sound(word, accent)
-                continue
-            if kl == "t":
-                accent = "UK" if accent == "US" else "US"
-                play_word_sound(word, accent)
-                continue
-            if kl == "m":
-                ui_mode = "disguise" if ui_mode == "study" else "study"
-                continue
-            if kl in ("u", "\x08"):
-                prev_word = await client.get_word(back=True)
-                if prev_word and prev_word.get("id"):
-                    word = prev_word
-                    break
-                continue
-            if kl in ("/", "d"):
-                show_dictionary_modal(console)
-                recall_start = time.monotonic()
-                continue
-
-            # 任意其他键揭晓答案
-            break
-
-        recall_duration_ms = int((time.monotonic() - recall_start) * 1000)
-
-        # ================= 第二屏：答案释义与评判阶段 =================
-        judge_start = time.monotonic()
-        status = ""
-
-        # 自动朗读首条例句
-        if config.auto_play_example and phrases:
-            first_en = phrases[0].get("en", "")
-            if first_en:
-                audio_engine.speak_sentence(first_en, accent=accent)
-
-        while True:
-            if ui_mode == "study":
-                render_study_answer_card(console, word, current_idx, srv_total, streak, accent, config.hide_judge_hint)
-            else:
-                render_disguise_answer_panel(console, word, current_idx, srv_total)
-
-            k = await async_read_key()
-            kl = k.lower()
-
-            if kl == "q":
-                console.print(Text("\n[已安全退出学习]", style="dim #6272a4"))
-                return
-            if kl == "b":
-                trigger_boss(console)
-                await async_read_key()
-                judge_start = time.monotonic()
-                continue
-            if kl == "h":
-                config.set("hide_judge_hint", not config.hide_judge_hint)
-                config.save()
-                continue
-            if kl == "p":
-                play_word_sound(word, accent)
-                continue
-            if kl == "e":
-                if phrases:
-                    audio_engine.speak_sentence(phrases[0].get("en", ""), accent=accent)
-                continue
-            if kl in ("4", "5", "6"):
-                idx = int(kl) - 4
-                if 0 <= idx < len(phrases):
-                    audio_engine.speak_sentence(phrases[idx].get("en", ""), accent=accent)
-                continue
-            if kl == "t":
-                accent = "UK" if accent == "US" else "US"
-                play_word_sound(word, accent)
-                continue
-            if kl == "m":
-                ui_mode = "disguise" if ui_mode == "study" else "study"
-                continue
-            if kl in ("u", "\x08"):
-                prev_word = await client.get_word(back=True)
-                if prev_word and prev_word.get("id"):
-                    word = prev_word
-                    break
-                continue
-            if kl in ("/", "d"):
-                show_dictionary_modal(console)
-                judge_start = time.monotonic()
-                continue
-
-            # 核心判答分支
-            if kl in ("1", "j"):
-                status = "RECOGNIZE"
-                stats["known"] += 1
-                stats["total"] += 1
-                break
-            elif kl in ("2", "k"):
-                status = "FUZZY"
-                stats["fuzzy"] += 1
-                stats["total"] += 1
-                break
-            elif kl in ("3", "l"):
-                status = "FORGET"
-                stats["forgot"] += 1
-                stats["total"] += 1
-                break
-            elif kl in ("0", "z"):
-                status = "WELL_FAMILIAR"
-                stats["mastered"] += 1
-                stats["total"] += 1
-                break
-
-        if not status:
+            if key == "r" and await show_advance_review_modal(console, client):
+                word = await _get_word(client)
+            if key == "/":
+                await show_dictionary_modal(console)
             continue
 
-        study_duration_ms = int((time.monotonic() - judge_start) * 1000)
+        phrases = [phrase.get("en", "") for phrase in word.get("phrases", [])[:3]]
+        finished = client.progress.get("finished", 0)
+        total = client.progress.get("total", 0)
+        recall_start = time.monotonic()
+        judge_start = None
+        recall_ms = 0
+        feedback = ""
+        audio_engine.stop()
+        if config.auto_play_audio:
+            play_word_sound(word, accent)
+        for phrase in phrases:
+            audio_engine.prefetch_sentence(phrase, accent=accent)
 
-        # 提交判答结果
-        ok = await client.submit_response(
-            word_id=word["id"],
-            result=status,
-            sm_n=word.get("sm_n", 0),
-            recall_duration=recall_duration_ms,
-            study_duration=study_duration_ms
-        )
-
-        if ok and client.last_next_word and client.last_next_word.get("id"):
-            word = client.last_next_word
-        else:
-            word = await client.get_word()
-
-    # 循环完毕，通关大捷
-    show_completion_screen(console, stats, streak)
-    while True:
-        k = await async_read_key()
-        kl = k.lower()
-        if kl == "q":
-            return
-        if kl == "r":
-            added = await show_advance_review_modal(console, client)
-            if added > 0:
-                await run_learning_session(client, config, console)
-                return
-        if kl == "/":
-            show_dictionary_modal(console)
-            show_completion_screen(console, stats, streak)
-
-
-# ============================================================================
-# 主入口
-# ============================================================================
-
-def main():
-    console = Console()
-    config = Config("config.json")
-
-    # 若未配置核心凭证，主动唤起交互式向导
-    if not config.ws_token:
-        wizard_ok = show_token_wizard(console, config, reason="missing")
-        if not wizard_ok or not config.ws_token:
-            console.print(Text("\n  [提示] 尚未配置 ws_token，已退出。", style="dim #6272a4"))
-            return
-
-    render_banner(console)
-
-    async def _async_start():
         while True:
-            client = MorrowClient(ws_token=config.ws_token, rest_token=config.rest_token)
-            console.print(Text("  正在建立安全长连接并同步学习进度 ...", style="dim #6272a4"))
-            
-            ok = await client.connect()
-            if not ok:
-                console.print(Text(f"  [连接失败] {client.last_error}", style="bold red"))
-                console.print(Text("  检测到 Token 可能已失效或过期。", style="bold #f1fa8c"))
-                retry = Prompt.ask("  是否立即启动 Token 向导重新获取并输入？", choices=["y", "n"], default="y")
-                if retry.lower() == "y":
-                    show_token_wizard(console, config, reason="expired")
-                    continue
-                else:
-                    return
-
-            init_ok = await client.initialize()
-            if not init_ok:
-                console.print(Text("  [握手失败] 无法初始化墨墨学习会话", style="bold red"))
-                retry = Prompt.ask("  是否重新配置 Token？", choices=["y", "n"], default="y")
-                if retry.lower() == "y":
-                    await client.close()
-                    show_token_wizard(console, config, reason="expired")
-                    continue
-                else:
-                    await client.close()
-                    return
-            break
-
-        streak_info = client.fetch_user_streak()
-        streak = streak_info.get("streak", 1)
-
-        def _render_menu():
-            console.clear()
-            render_banner(console)
-            console.print()
-            console.print(Text(f"  🔥 墨墨已连续打卡: {streak} 天  │  界面模式: [{config.ui_mode}]  │  默认发音: [{config.accent}]", style="bold #50fa7b"))
-            console.print()
-            if not config.hide_judge_hint:
-                console.print(Text("  按 [y] 开始背词   [r] 提前复习   [/] 查词典   [s] 设置/Token   [m] 切伪装模式   [h] 隐藏提示   [q] 退出", style="bold #00f0ff"))
+            answered = judge_start is not None
+            if ui_mode == "study":
+                render = render_study_answer_card if answered else render_study_recall_card
+                render(console, word, finished, total, accent=accent, hide_judge_hint=config.hide_judge_hint)
             else:
-                console.print(Text("  按 [y] 开始背词  │  [s] 设置  │  [h] 显示提示", style="dim #6272a4"))
+                render = render_disguise_answer_panel if answered else render_disguise_recall_panel
+                render(console, word, finished + 1, total, config.hide_judge_hint)
+            if feedback:
+                console.print(Text(feedback, style="bold #f1fa8c"))
+                feedback = ""
 
-        _render_menu()
+            key = (await async_read_key()).lower()
+            if key == "q":
+                console.print(Text("\n[已退出学习]", style="dim #6272a4"))
+                return
+            elif key == "b":
+                audio_engine.stop()
+                trigger_boss(console)
+                await async_read_key()
+            elif key == "h":
+                if not config.update(hide_judge_hint=not config.hide_judge_hint):
+                    feedback = "无法保存提示栏设置。"
+            elif key == "p":
+                play_word_sound(word, accent)
+            elif key == "t":
+                accent = "UK" if accent == "US" else "US"
+                play_word_sound(word, accent)
+                for phrase in phrases:
+                    audio_engine.prefetch_sentence(phrase, accent=accent)
+            elif key == "m":
+                ui_mode = "disguise" if ui_mode == "study" else "study"
+            elif key in ("u", "\x08", "\x7f"):
+                previous = await client.get_word(back=True)
+                if previous is None:
+                    if not client.last_request_rejected:
+                        raise StudyError(f"{client.last_error or '连接中断'}。撤回结果未确认，请重新进入学习并同步进度。")
+                    feedback = client.last_error or "无法撤回判答"
+                elif previous.get("id"):
+                    if history and history[-1][0] == previous["id"]:
+                        _, category = history.pop()
+                        stats[category] -= 1
+                        stats["total"] -= 1
+                    word = previous
+                    break
+                else:
+                    feedback = "没有可撤回的单词。"
+            elif key in ("/", "d"):
+                await show_dictionary_modal(console)
+                if answered:
+                    judge_start = time.monotonic()
+                else:
+                    recall_start = time.monotonic()
+            elif not answered and key in (" ", "\r", "\n"):
+                judge_start = time.monotonic()
+                recall_ms = int((judge_start - recall_start) * 1000)
+                if config.auto_play_example and phrases:
+                    audio_engine.speak_sentence(phrases[0], accent=accent)
+            elif answered and key in ("e", "4", "5", "6"):
+                index = 0 if key == "e" else int(key) - 4
+                if index < len(phrases):
+                    audio_engine.speak_sentence(phrases[index], accent=accent)
+            elif answered and key in JUDGMENTS:
+                response, category = JUDGMENTS[key]
+                ok = await client.submit_response(
+                    word_id=word["id"], response=response, study_method="STUDY_EN_CN",
+                    recall_duration=recall_ms,
+                    study_duration=int((time.monotonic() - judge_start) * 1000),
+                )
+                if not ok:
+                    if client.last_request_rejected:
+                        feedback = client.last_error or "判答未保存，请重试。"
+                        continue
+                    raise StudyError(f"{client.last_error or '连接中断'}。判答结果未确认，请重新进入学习并同步进度。")
+                history.append((word["id"], category))
+                stats[category] += 1
+                stats["total"] += 1
+                word = client.last_next_word
+                if word is None:
+                    word = await _get_word(client)
+                break
+
+
+def _render_menu(console: Console, config: Config, progress: Dict[str, int], message: str) -> None:
+    console.clear()
+    render_banner(console)
+    if progress:
+        console.print(Text(f"  墨墨今日进度 {progress['finished']}/{progress['total']} 词", style="bold #50fa7b"))
+    elif config.rest_token:
+        console.print(Text("  墨墨今日进度暂不可用", style="dim #6272a4"))
+    console.print(Text(f"  界面模式 [{config.ui_mode}]  │  默认发音 [{config.accent}]", style="bold #50fa7b"))
+    if message:
+        console.print(Text(f"  {message}", style="bold #f1fa8c"))
+    console.print()
+    if config.hide_judge_hint:
+        console.print(Text("  [y] 开始背词  [s] 设置  [h] 显示提示  [q] 退出", style="dim #6272a4"))
+    else:
+        console.print(Text("  [y] 开始背词  [r] 提前复习  [/] 查词典  [s] 设置  [m] 切换模式  [h] 隐藏提示  [q] 退出", style="bold #00f0ff"))
+
+
+async def _connect(client: MorrowClient, console: Console) -> None:
+    console.print(Text("  正在连接墨墨并同步学习进度 …", style="dim #6272a4"))
+    if not await client.connect() or not await client.initialize():
+        await client.close()
+        raise StudyError(f"{client.last_error or '学习会话初始化失败'}。按 [y] 重试，或按 [s] 检查凭证。")
+    client.progress = await asyncio.to_thread(client.fetch_study_progress)
+
+
+async def _run(console: Console, config: Config) -> None:
+    client = None
+    message = ""
+    try:
+        if not config.ws_token:
+            await show_token_wizard(console, config, reason="missing")
+        if config.ws_token:
+            client = MorrowClient(config.ws_token, config.rest_token)
+            try:
+                await _connect(client, console)
+            except StudyError as exc:
+                message = str(exc)
+        else:
+            message = "尚未配置 ws_token，可在设置中继续配置。"
 
         while True:
-            k = await async_read_key()
-            kl = k.lower()
-            if kl in ("y", "\r", " "):
-                await run_learning_session(client, config, console)
-                break
-            elif kl == "r":
-                added = await show_advance_review_modal(console, client)
-                if added > 0:
+            _render_menu(console, config, client.progress if client else {}, message)
+            message = ""
+            key = (await async_read_key()).lower()
+            if key == "q":
+                return
+            if key == "/":
+                await show_dictionary_modal(console)
+            elif key == "s":
+                await show_settings_modal(console, config)
+                if client is not None and client.ws_token != config.ws_token:
+                    await client.close()
+                    client = None
+                    message = "背词凭证已更新，开始背词时将连接墨墨。"
+                elif client is not None and client.rest_token != config.rest_token:
+                    client.rest_token = config.rest_token
+                    client.progress = await asyncio.to_thread(client.fetch_study_progress)
+            elif key == "h":
+                if not config.update(hide_judge_hint=not config.hide_judge_hint):
+                    message = "无法保存提示栏设置。"
+            elif key == "m":
+                mode = "disguise" if config.ui_mode == "study" else "study"
+                if not config.update(ui_mode=mode):
+                    message = "无法保存界面模式。"
+            elif key in ("y", " ", "\r", "\n", "r"):
+                if not config.ws_token and not await show_token_wizard(console, config, reason="missing"):
+                    continue
+                try:
+                    if client is None:
+                        client = MorrowClient(config.ws_token, config.rest_token)
+                    if not client.is_alive:
+                        await _connect(client, console)
+                    if key == "r" and not await show_advance_review_modal(console, client):
+                        continue
                     await run_learning_session(client, config, console)
-                    break
-            elif kl == "/":
-                show_dictionary_modal(console)
-                _render_menu()
-            elif kl == "s":
-                show_settings_modal(console, config)
-                _render_menu()
-            elif kl == "h":
-                config.set("hide_judge_hint", not config.hide_judge_hint)
-                config.save()
-                _render_menu()
-            elif kl == "m":
-                new_mode = "disguise" if config.ui_mode == "study" else "study"
-                config.set("ui_mode", new_mode)
-                config.save()
-                _render_menu()
-            elif kl == "q":
-                break
+                    return
+                except StudyError as exc:
+                    await client.close()
+                    message = str(exc)
+                finally:
+                    audio_engine.stop()
+    finally:
+        audio_engine.stop()
+        if client is not None:
+            await client.close()
 
-        await client.close()
-        console.print(Text("\n✦ 感谢使用 Morrow · Build for Tomorrow ✦\n", style="bold #00f0ff"))
 
+def main() -> None:
+    console = Console()
+    config = Config(Path(__file__).resolve().parent.parent / "config.json")
+    audio_engine.cache_dir = config.config_path.parent / config.data_dir / "audio_cache"
     try:
-        asyncio.run(_async_start())
+        asyncio.run(_run(console, config))
     except KeyboardInterrupt:
         console.print(Text("\n[已中断退出]", style="dim #6272a4"))
+    except EOFError:
+        pass
+
 
 if __name__ == "__main__":
     main()

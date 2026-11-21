@@ -5,6 +5,8 @@ Morrow 配置管理器 (Configuration Manager)
 
 import os
 import json
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Dict, Any
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -21,30 +23,62 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 class Config:
     def __init__(self, config_path: str = "config.json"):
-        self.config_path = config_path
-        self._data: Dict[str, Any] = dict(DEFAULT_CONFIG)
+        self.config_path = Path(config_path).resolve()
+        self._data: Dict[str, Any] = {}
         self.load()
 
     def load(self) -> None:
-        if os.path.exists(self.config_path):
-            try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    user_data = json.load(f)
-                if isinstance(user_data, dict):
-                    self._data.update(user_data)
-            except Exception as e:
-                print(f"[警告] 读取配置文件失败: {e}，使用默认配置")
-        else:
+        self._data = dict(DEFAULT_CONFIG)
+        try:
+            with self.config_path.open(encoding="utf-8-sig") as f:
+                user_data = json.load(f)
+            if not isinstance(user_data, dict):
+                raise ValueError("配置必须为 JSON 对象")
+        except FileNotFoundError:
             self.save()
+            return
+        except (OSError, ValueError) as e:
+            print(f"[警告] 读取配置文件失败: {e}，使用默认配置")
+            return
+
+        for key, value in user_data.items():
+            if key not in DEFAULT_CONFIG or type(value) is type(DEFAULT_CONFIG[key]):
+                self._data[key] = value
+
+        mode = self._data["ui_mode"].strip().lower()
+        self._data["ui_mode"] = mode if mode in {"study", "disguise"} else "study"
+        accent = self._data["accent"].strip().upper()
+        self._data["accent"] = accent if accent in {"US", "UK"} else "US"
 
     def save(self) -> bool:
+        pending_path = None
         try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
+            with NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.config_path.parent,
+                prefix=f".{self.config_path.name}.", suffix=".tmp", delete=False,
+            ) as f:
+                pending_path = Path(f.name)
                 json.dump(self._data, f, ensure_ascii=False, indent=4)
+                f.write("\n")
+            os.replace(pending_path, self.config_path)
             return True
-        except Exception as e:
+        except (OSError, TypeError, ValueError) as e:
             print(f"[错误] 保存配置文件失败: {e}")
             return False
+        finally:
+            if pending_path is not None:
+                try:
+                    pending_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def update(self, **changes: Any) -> bool:
+        previous = self._data.copy()
+        self._data.update(changes)
+        if self.save():
+            return True
+        self._data = previous
+        return False
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._data.get(key, default)
@@ -54,11 +88,13 @@ class Config:
 
     @property
     def ws_token(self) -> str:
-        return str(self._data.get("ws_token", "")).strip()
+        token = self._data["ws_token"].strip()
+        return "" if token == "YOUR_MAIMEMO_WS_TOKEN_HERE" else token
 
     @property
     def rest_token(self) -> str:
-        return str(self._data.get("rest_token", "")).strip()
+        token = self._data["rest_token"].strip()
+        return "" if token == "YOUR_MAIMEMO_REST_TOKEN_HERE" else token
 
     @property
     def ui_mode(self) -> str:
@@ -78,7 +114,7 @@ class Config:
 
     @property
     def data_dir(self) -> str:
-        return str(self._data.get("data_dir", "data"))
+        return self._data["data_dir"].strip() or "data"
 
     @property
     def record_enabled(self) -> bool:

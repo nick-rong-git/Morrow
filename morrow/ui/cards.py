@@ -6,21 +6,24 @@ Morrow 核心卡片渲染引擎 (Cards Engine)
 """
 
 import time
-import random
+import json
 from typing import Dict, Any, List
 from rich.console import Console
 from rich.text import Text
 from rich.panel import Panel
 from rich.table import Table
 from rich.align import Align
-from rich.box import ROUNDED, SIMPLE, DOUBLE_EDGE
 
 from .theme import (
-    COLOR_PRIMARY, COLOR_SECONDARY, COLOR_SUCCESS,
-    COLOR_WARNING, COLOR_DANGER, COLOR_MUTED, COLOR_TEXT_MAIN,
+    COLOR_PRIMARY, COLOR_SECONDARY, COLOR_TEXT_MAIN,
     CARD_BOX, STYLE_HIGHLIGHT
 )
 from .components import render_progress_bar, render_judge_hotkeys, render_recall_hotkeys
+
+PARTS_OF_SPEECH = {
+    "a", "abbr", "ad", "adj", "adv", "art", "aux", "conj", "det", "int", "interj",
+    "modal", "n", "num", "phr", "prep", "pron", "v", "vi", "vt",
+}
 
 def _now_str() -> str:
     return time.strftime("%H:%M:%S")
@@ -34,7 +37,7 @@ def render_study_recall_card(
     word: Dict[str, Any],
     current: int,
     total: int,
-    streak: int = 1,
+    streak: int | None = None,
     accent: str = "US",
     hide_judge_hint: bool = False
 ) -> None:
@@ -46,7 +49,8 @@ def render_study_recall_card(
 
     # 主词卡
     spelling = word.get("spelling", "")
-    phonetic = word.get(f"phonetic_{accent.lower()}") or word.get("phonetic_us") or word.get("phonetic_uk") or ""
+    phonetic_accent = accent if word.get(f"phonetic_{accent.lower()}") else ("US" if word.get("phonetic_us") else "UK")
+    phonetic = word.get(f"phonetic_{phonetic_accent.lower()}", "")
     hyphenation = word.get("hyphenation", "")
     difficulty = word.get("difficulty", 0)
 
@@ -55,7 +59,7 @@ def render_study_recall_card(
     
     if phonetic:
         content.append(f"/{phonetic}/ ", style=f"bold {COLOR_SECONDARY}")
-        content.append(f"[{accent.upper()} 🔊]  ", style="dim #8be9fd")
+        content.append(f"[{phonetic_accent} 🔊]  ", style="dim #8be9fd")
         
     if hyphenation and hyphenation != spelling:
         content.append(f" ·  音节: {hyphenation}  ", style="dim #6272a4")
@@ -63,7 +67,7 @@ def render_study_recall_card(
     if difficulty:
         content.append(" " + "★" * min(5, difficulty), style="#f1fa8c")
         
-    content.append("\n\n(请在心中回忆释义与拼写，按任意键揭晓答案)\n", style="italic dim #6272a4")
+    content.append("\n\n(回忆释义后，按空格或回车查看答案)\n", style="italic dim #6272a4")
 
     panel = Panel(
         Align.center(content),
@@ -89,7 +93,7 @@ def render_study_answer_card(
     word: Dict[str, Any],
     current: int,
     total: int,
-    streak: int = 1,
+    streak: int | None = None,
     accent: str = "US",
     hide_judge_hint: bool = False
 ) -> None:
@@ -128,24 +132,21 @@ def render_study_answer_card(
 
     # 2. 词义解析 (分词性药丸高亮)
     interp_table = Table(show_header=False, box=None, padding=(0, 1), collapse_padding=True)
-    interp_table.add_column(width=8, style="bold #50fa7b")
+    interp_table.add_column(min_width=8, no_wrap=True, style="bold #50fa7b")
     interp_table.add_column(style=f"bold {COLOR_TEXT_MAIN}")
 
-    interpretations = word.get("interpretations", [])
-    if not interpretations and word.get("interpretation"):
-        interpretations = [l.strip() for l in word["interpretation"].split("\n") if l.strip()]
-
-    for line in interpretations:
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(".", 1)
-        if len(parts) == 2 and len(parts[0]) <= 6:
-            pos = parts[0].strip() + "."
-            meaning = parts[1].strip()
-            interp_table.add_row(f"[{pos}]", meaning)
-        else:
-            interp_table.add_row("•", line)
+    interpretations = word.get("interpretations") or [word.get("interpretation") or ""]
+    for interpretation in interpretations:
+        for raw_line in interpretation.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            prefix, dot, meaning = line.partition(".")
+            prefix = prefix.rstrip()
+            if dot and prefix.lower() in PARTS_OF_SPEECH:
+                interp_table.add_row(Text(f"[{prefix}.]"), Text(meaning.lstrip()))
+            else:
+                interp_table.add_row("•", Text(line))
 
     # 3. 精选例句与短语
     phrases = word.get("phrases", [])
@@ -228,56 +229,150 @@ def render_study_answer_card(
 
 
 # ============================================================================
-# 摸鱼模式：伪装为开发环境代码日志
+# 摸鱼模式：伪装为标准无色 JSON API 响应 / 配置载荷
 # ============================================================================
 
 def render_disguise_recall_panel(
     console: Console,
     word: Dict[str, Any],
     current: int,
-    total: int
+    total: int,
+    hide_judge_hint: bool = False,
 ) -> None:
     console.clear()
     spelling = word.get("spelling", "")
-    
-    console.print(Text(f"[{_now_str()}] [INFO]  [worker-pool] task_id=7410 ready: payload_len={len(spelling)*14}", style="dim #6272a4"))
-    console.print(Text(f"[{_now_str()}] [DEBUG] [cache::redis] GET key=\"module_cache:{spelling}\" -> miss (0.24ms)", style="dim #6272a4"))
-    
-    # 单词伪装为待编译变量名
-    line = Text()
-    line.append(f"[{_now_str()}] [TRACE] ", style="dim #6272a4")
-    line.append("resolving symbol ", style="#8be9fd")
-    line.append(f'"{spelling}"', style=f"bold {COLOR_PRIMARY}")
-    line.append(f" (idx: {current}/{total}) ...", style="dim #6272a4")
-    console.print(line)
-    
+    phonetic_us = word.get("phonetic_us", "")
+    phonetic_uk = word.get("phonetic_uk", "")
+    hyphenation = word.get("hyphenation", "")
+    difficulty = word.get("difficulty", 0)
+
+    # 构造全面真实的 JSON 载荷（未揭晓阶段，无中文释义泄漏）
+    data = {
+        "status": "pending_eval",
+        "timestamp": int(time.time()),
+        "query": {
+            "symbol": spelling,
+            "phonetic": {
+                "us": f"/{phonetic_us}/" if phonetic_us else "",
+                "uk": f"/{phonetic_uk}/" if phonetic_uk else ""
+            },
+            "syllables": hyphenation,
+            "difficulty_level": difficulty
+        },
+        "payload": {
+            "resolved": False,
+            "message": "awaiting evaluation; press [space/enter] to fetch definition and examples"
+        },
+        "session": {
+            "index": min(current, total) if total > 0 else current,
+            "total": total,
+            "remaining": max(0, total - current)
+        }
+    }
+
+    # 序列化为规范 JSON 字符串
+    json_text = json.dumps(data, ensure_ascii=False, indent=2)
+
+    # 保证字体 100% 没有任何颜色（无 ANSI 转义代码，关闭所有高亮与 markup）
+    console.print(json_text, markup=False, highlight=False, style="none")
     console.print()
-    console.print(Text("  ^ [Space/Enter] inspect struct  [p] audio  [u] undo  [/] search  [m] switch mode  [b] boss", style="dim #6272a4"))
+
+    # 底栏提示行也保持完全单色无色
+    if hide_judge_hint:
+        console.print("[h] show keys", markup=False, highlight=False, style="none")
+    else:
+        console.print("[Space/Enter] inspect payload  [p] audio  [t] accent  [u] undo  [/] lookup  [h] hide  [m] mode  [b] boss  [q] quit", markup=False, highlight=False, style="none")
 
 
 def render_disguise_answer_panel(
     console: Console,
     word: Dict[str, Any],
     current: int,
-    total: int
+    total: int,
+    hide_judge_hint: bool = False,
 ) -> None:
     console.clear()
     spelling = word.get("spelling", "")
-    interpretation = word.get("interpretation", "").replace("\n", " ; ")
-    
-    console.print(Text(f"[{_now_str()}] [INFO]  [compiler] parsed AST for symbol \"{spelling}\"", style="dim #6272a4"))
-    
-    # 释义伪装为文档注释
-    line = Text()
-    line.append(f"[{_now_str()}] [DOC]   ", style="dim #50fa7b")
-    line.append(f"/** {interpretation} */", style=f"bold {COLOR_TEXT_MAIN}")
-    console.print(line)
+    phonetic_us = word.get("phonetic_us", "")
+    phonetic_uk = word.get("phonetic_uk", "")
+    hyphenation = word.get("hyphenation", "")
+    difficulty = word.get("difficulty", 0)
 
-    phrases = word.get("phrases", [])
-    if phrases:
-        p_en = phrases[0].get("en", "")
-        p_cn = phrases[0].get("cn", "")
-        console.print(Text(f"[{_now_str()}] [TEST]  example: \"{p_en}\" // {p_cn}", style="dim #8be9fd"))
+    # 提取完整词性与释义结构
+    definitions = []
+    interpretations = word.get("interpretations", [])
+    if not interpretations and word.get("interpretation"):
+        interpretations = [l.strip() for l in word["interpretation"].split("\n") if l.strip()]
 
+    for line in interpretations:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(".", 1)
+        if len(parts) == 2 and len(parts[0]) <= 6:
+            definitions.append({
+                "pos": parts[0].strip() + ".",
+                "meaning": parts[1].strip()
+            })
+        else:
+            definitions.append({
+                "meaning": line
+            })
+
+    # 提取全部权威真题例句
+    examples = []
+    for idx, p in enumerate(word.get("phrases", [])):
+        examples.append({
+            "id": idx + 1,
+            "en": p.get("en", ""),
+            "cn": p.get("cn", ""),
+            "tags": p.get("tags", [])
+        })
+
+    # 助记笔记
+    notes = []
+    for n in word.get("notes", []):
+        t = n.get("title", "")
+        c = n.get("content", "")
+        if t or c:
+            notes.append({
+                "title": t,
+                "content": c
+            })
+
+    # 构造全面详尽的 JSON 响应
+    data = {
+        "status": "resolved",
+        "code": 200,
+        "timestamp": int(time.time()),
+        "query": {
+            "symbol": spelling,
+            "phonetic": {
+                "us": f"/{phonetic_us}/" if phonetic_us else "",
+                "uk": f"/{phonetic_uk}/" if phonetic_uk else ""
+            },
+            "syllables": hyphenation,
+            "difficulty_level": difficulty
+        },
+        "definitions": definitions,
+        "examples": examples,
+        "notes": notes,
+        "session": {
+            "index": min(current, total) if total > 0 else current,
+            "total": total,
+            "remaining": max(0, total - current)
+        }
+    }
+
+    # 序列化为规范 JSON 字符串
+    json_text = json.dumps(data, ensure_ascii=False, indent=2)
+
+    # 保证字体 100% 没有任何颜色（无 ANSI 转义代码，关闭所有高亮与 markup）
+    console.print(json_text, markup=False, highlight=False, style="none")
     console.print()
-    console.print(Text("  [1] pass(认识)  [2] retry(模糊)  [3] fail(忘记)  [0] archive(斩词)  |  [p] audio  [e] sentence  |  [u] undo  [m] mode", style="dim #6272a4"))
+
+    # 判答提示行也保持完全单色无色
+    if hide_judge_hint:
+        console.print("[h] show keys", markup=False, highlight=False, style="none")
+    else:
+        console.print("[1] pass  [2] vague  [3] fail  [0] archive  |  [p] audio  [e] sentence  [t] accent  |  [u] undo  [/] search  [h] hide  [m] mode  [b] boss  [q] quit", markup=False, highlight=False, style="none")
