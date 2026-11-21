@@ -215,11 +215,15 @@ async def run_learning_session(
                 break
 
 
-def _render_menu(console: Console, config: Config, progress: Dict[str, int], message: str) -> None:
+def _render_menu(
+    console: Console, config: Config, progress: Dict[str, int], message: str, *, rest_auth_failed: bool = False,
+) -> None:
     console.clear()
     render_banner(console)
     if progress:
         console.print(Text(f"  墨墨今日进度 {progress['finished']}/{progress['total']} 词", style="bold #50fa7b"))
+    elif rest_auth_failed:
+        console.print(Text("  开放 API 凭证已失效或缺少权限。按 [s] → [2] 更新。", style="bold #f1fa8c"))
     elif config.rest_token:
         console.print(Text("  墨墨今日进度暂不可用", style="dim #6272a4"))
     console.print(Text(f"  界面模式 [{config.ui_mode}]  │  默认发音 [{config.accent}]", style="bold #50fa7b"))
@@ -256,7 +260,10 @@ async def _run(console: Console, config: Config) -> None:
             message = "尚未配置 ws_token，可在设置中继续配置。"
 
         while True:
-            _render_menu(console, config, client.progress if client else {}, message)
+            _render_menu(
+                console, config, client.progress if client else {}, message,
+                rest_auth_failed=bool(client and client.rest_auth_failed),
+            )
             message = ""
             key = (await async_read_key()).lower()
             if key == "q":

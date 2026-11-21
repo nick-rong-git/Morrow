@@ -7,10 +7,11 @@ from tempfile import TemporaryDirectory
 import threading
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
+from urllib.error import HTTPError
 
 from rich.console import Console
 
-from morrow import cli
+from morrow import cli, clipboard
 from morrow import web_login
 from morrow.audio import AudioEngine
 from morrow.client import (
@@ -253,6 +254,36 @@ class AsyncRegressions(unittest.IsolatedAsyncioTestCase):
         save.assert_awaited_once_with(self.console, self.config, "manual%2Btoken")
         self.assertTrue(ask.call_args.kwargs["password"])
 
+    async def test_rest_setup_opens_official_page_and_imports_copied_token(self):
+        token = "synthetic-rest-credential-001"
+        client = Mock(fetch_study_progress=Mock(return_value={"finished": 0, "total": 0}))
+        with (
+            patch.object(views, "_ask", AsyncMock(side_effect=["2", "i", "q"])),
+            patch.object(views, "clipboard_sequence", return_value=9),
+            patch.object(views, "read_copied_text", return_value=f"Bearer {token}") as read,
+            patch.object(views, "_open_in_browser", AsyncMock()) as open_page,
+            patch.object(views, "MorrowClient", return_value=client) as make_client,
+        ):
+            await views.show_settings_modal(self.console, self.config)
+        open_page.assert_awaited_once_with(self.console, web_login.OPEN_API_TOKEN_URL)
+        read.assert_called_once_with(9)
+        make_client.assert_called_once_with(ws_token="", rest_token=token)
+        self.assertEqual(Config(self.config.config_path).rest_token, token)
+        self.assertNotIn(token, self.buffer.getvalue())
+
+    async def test_failed_rest_validation_keeps_saved_token(self):
+        self.config.update(rest_token="old-token")
+        client = Mock(fetch_study_progress=Mock(return_value={}), rest_auth_failed=True)
+        with (
+            patch.object(views, "clipboard_sequence", return_value=None),
+            patch.object(views, "_ask", AsyncMock(side_effect=["rejected-token", ""])),
+            patch.object(views, "_open_in_browser", AsyncMock()),
+            patch.object(views, "MorrowClient", return_value=client),
+        ):
+            self.assertFalse(await views._update_rest_token(self.console, self.config))
+        self.assertEqual(Config(self.config.config_path).rest_token, "old-token")
+        self.assertIn("凭证已失效", self.buffer.getvalue())
+
     async def test_browser_observes_only_the_expected_study_page_and_socket(self):
         events = {}
         page = Mock(on=Mock(side_effect=events.__setitem__), url="https://other.invalid")
@@ -302,6 +333,30 @@ class CardRegressions(unittest.TestCase):
 
 
 class StorageRegressions(unittest.TestCase):
+    def test_reads_clipboard_text_only_after_a_new_copy(self):
+        api = Mock(
+            CF_UNICODETEXT=13,
+            GetClipboardSequenceNumber=Mock(return_value=9),
+            IsClipboardFormatAvailable=Mock(return_value=True),
+            GetClipboardData=Mock(return_value="synthetic-token"),
+        )
+        with patch.object(clipboard, "win32clipboard", api):
+            self.assertEqual(clipboard.read_copied_text(9), "")
+            api.GetClipboardData.assert_not_called()
+            api.GetClipboardSequenceNumber.return_value = 10
+            self.assertEqual(clipboard.read_copied_text(9), "synthetic-token")
+        api.GetClipboardData.assert_called_once_with(13)
+        self.assertEqual(api.CloseClipboard.call_count, 2)
+
+    def test_progress_distinguishes_auth_failure_from_unavailability(self):
+        client = MorrowClient(ws_token="", rest_token="synthetic-token")
+        with patch("morrow.client.urllib.request.urlopen", side_effect=HTTPError("", 401, "", None, None)):
+            self.assertEqual(client.fetch_study_progress(), {})
+            self.assertTrue(client.rest_auth_failed)
+        with patch("morrow.client.urllib.request.urlopen", side_effect=OSError("offline")):
+            self.assertEqual(client.fetch_study_progress(), {})
+            self.assertFalse(client.rest_auth_failed)
+
     def test_study_url_rejects_ambiguous_or_non_official_credentials(self):
         endpoint = "wss://tc-apis.maimemo.com/study/ws/webstudy"
         self.assertEqual(web_login.token_from_study_url(endpoint + "?token=valid%2Btoken"), "valid%2Btoken")

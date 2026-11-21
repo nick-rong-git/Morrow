@@ -4,6 +4,7 @@ Morrow 模态弹窗与特色视图 (Views)
 """
 
 import asyncio
+import re
 import webbrowser
 from typing import Dict, Any
 from rich.box import DOUBLE_EDGE
@@ -15,6 +16,7 @@ from rich.align import Align
 from rich.prompt import Prompt
 
 from .theme import CARD_BOX, MODAL_BOX
+from ..clipboard import clipboard_sequence, read_copied_text
 from ..client import MorrowClient
 from ..dict import lookup_dictionary
 from ..audio import audio_engine
@@ -272,6 +274,50 @@ async def show_token_wizard(console: Console, config, reason: str = "missing") -
     return await _paste_ws_token(console, config)
 
 
+async def _update_rest_token(console: Console, config) -> bool:
+    sequence = clipboard_sequence()
+    await _open_in_browser(console, OPEN_API_TOKEN_URL)
+    console.print(Text("  在墨墨官网登录并复制开放 API 凭证。", style="dim #8be9fd"))
+    while True:
+        copied = False
+        if sequence is not None:
+            action = await _ask(
+                console, "  回车导入刚复制的凭证，m 手动粘贴，q 返回",
+                choices=["i", "m", "q"], default="i", show_choices=False, show_default=False,
+            )
+            if action == "q":
+                return False
+            copied = action == "i"
+
+        if copied:
+            value = (await asyncio.to_thread(read_copied_text, sequence)).strip()
+            if not value:
+                console.print(Text("  未读取到新复制的文本。请在官网复制凭证，或选择手动粘贴。", style="bold #f1fa8c"))
+                continue
+        else:
+            value = (await _ask(console, "  粘贴开放 API 凭证（回车返回）", password=True)).strip()
+            if not value:
+                return False
+
+        token = value[7:].strip() if value.lower().startswith("bearer ") else value
+        if token_from_study_url(token):
+            console.print(Text("  这是背词凭证地址，可用设置 1 或 7 配置。", style="bold #f1fa8c"))
+            continue
+        if (copied and len(token) < 24) or not re.fullmatch(r"[A-Za-z0-9._~+/\-]+=*", token):
+            console.print(Text("  凭证格式无效。请复制官网显示的 Token，或选择手动粘贴。", style="bold #f1fa8c"))
+            continue
+
+        console.print(Text("  正在用墨墨开放 API 验证凭证…", style="dim #6272a4"))
+        client = MorrowClient(ws_token="", rest_token=token)
+        if await asyncio.to_thread(client.fetch_study_progress):
+            return config.update(rest_token=token)
+        message = (
+            "  凭证已失效或缺少学习数据权限。请重新领取后再试。"
+            if client.rest_auth_failed else "  墨墨今日进度接口暂时无法验证凭证。请稍后再试。"
+        )
+        console.print(Text(message, style="bold #f1fa8c"))
+
+
 async def show_settings_modal(console: Console, config) -> None:
     message = ""
     while True:
@@ -282,7 +328,7 @@ async def show_settings_modal(console: Console, config) -> None:
         t.add_column("当前状态/值", style="#50fa7b")
 
         t.add_row(Text("[1]"), "网页登录 / 更新背词凭证", "已设置" if config.ws_token else "未设置")
-        t.add_row(Text("[2]"), "开放 API 凭证 (rest_token)", "已设置" if config.rest_token else "未设置")
+        t.add_row(Text("[2]"), "打开官网并更新开放 API 凭证", "已设置" if config.rest_token else "未设置")
         t.add_row(Text("[3]"), "打开墨墨学习网页", WEB_STUDY_URL)
         t.add_row(Text("[4]"), "发音偏好 (美音 / 英音)", config.accent)
         t.add_row(Text("[5]"), "单词自动发音", "开启" if config.auto_play_audio else "关闭")
@@ -310,15 +356,9 @@ async def show_settings_modal(console: Console, config) -> None:
             continue
 
         if choice == "2":
-            if (await _ask(console, "  是否打开墨墨官方开放 API 凭证页？", choices=["y", "n"], default="n")) == "y":
-                await _open_in_browser(console, OPEN_API_TOKEN_URL)
-            token = (await _ask(console, "  输入新的 rest_token（回车取消）", password=True)).strip()
-            if not token:
-                continue
-            if token_from_study_url(token):
-                message = "这是背词凭证地址。请用设置 1 或 7 配置。"
-                continue
-            saved = config.update(rest_token=token)
+            if await _update_rest_token(console, config):
+                message = "开放 API 凭证已验证并保存。"
+            continue
         elif choice == "4":
             saved = config.update(accent="UK" if config.accent == "US" else "US")
         elif choice == "5":

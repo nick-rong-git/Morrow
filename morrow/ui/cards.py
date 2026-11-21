@@ -229,8 +229,15 @@ def render_study_answer_card(
 
 
 # ============================================================================
-# 摸鱼模式：伪装为标准无色 JSON API 响应 / 配置载荷
+# 摸鱼模式：极简实用无色 JSON 格式（无多余字段，无滚动负担，零颜色）
 # ============================================================================
+
+def _clean_phonetic(ph: str) -> str:
+    if not ph:
+        return ""
+    p = ph.strip().strip("/").strip("[").strip("]").strip()
+    return f"/{p}/" if p else ""
+
 
 def render_disguise_recall_panel(
     console: Console,
@@ -241,47 +248,23 @@ def render_disguise_recall_panel(
 ) -> None:
     console.clear()
     spelling = word.get("spelling", "")
-    phonetic_us = word.get("phonetic_us", "")
-    phonetic_uk = word.get("phonetic_uk", "")
-    hyphenation = word.get("hyphenation", "")
-    difficulty = word.get("difficulty", 0)
+    ph = word.get("phonetic_us") or word.get("phonetic_uk") or ""
 
-    # 构造全面真实的 JSON 载荷（未揭晓阶段，无中文释义泄漏）
+    # 极简实用 JSON（看词回忆阶段：仅保留词、音标与进度）
     data = {
-        "status": "pending_eval",
-        "timestamp": int(time.time()),
-        "query": {
-            "symbol": spelling,
-            "phonetic": {
-                "us": f"/{phonetic_us}/" if phonetic_us else "",
-                "uk": f"/{phonetic_uk}/" if phonetic_uk else ""
-            },
-            "syllables": hyphenation,
-            "difficulty_level": difficulty
-        },
-        "payload": {
-            "resolved": False,
-            "message": "awaiting evaluation; press [space/enter] to fetch definition and examples"
-        },
-        "session": {
-            "index": min(current, total) if total > 0 else current,
-            "total": total,
-            "remaining": max(0, total - current)
-        }
+        "word": spelling,
+        "phonetic": _clean_phonetic(ph),
+        "progress": f"{min(current, total)}/{total}" if total > 0 else str(current)
     }
 
-    # 序列化为规范 JSON 字符串
     json_text = json.dumps(data, ensure_ascii=False, indent=2)
-
-    # 保证字体 100% 没有任何颜色（无 ANSI 转义代码，关闭所有高亮与 markup）
     console.print(json_text, markup=False, highlight=False, style="none")
     console.print()
 
-    # 底栏提示行也保持完全单色无色
     if hide_judge_hint:
         console.print("[h] show keys", markup=False, highlight=False, style="none")
     else:
-        console.print("[Space/Enter] inspect payload  [p] audio  [t] accent  [u] undo  [/] lookup  [h] hide  [m] mode  [b] boss  [q] quit", markup=False, highlight=False, style="none")
+        console.print("[Space] view  [p] audio  [t] accent  [u] undo  [/] lookup  [h] hide  [m] mode  [b] boss  [q] quit", markup=False, highlight=False, style="none")
 
 
 def render_disguise_answer_panel(
@@ -293,86 +276,49 @@ def render_disguise_answer_panel(
 ) -> None:
     console.clear()
     spelling = word.get("spelling", "")
-    phonetic_us = word.get("phonetic_us", "")
-    phonetic_uk = word.get("phonetic_uk", "")
-    hyphenation = word.get("hyphenation", "")
-    difficulty = word.get("difficulty", 0)
+    ph = word.get("phonetic_us") or word.get("phonetic_uk") or ""
 
-    # 提取完整词性与释义结构
-    definitions = []
+    # 释义精简为整洁的单行中文
     interpretations = word.get("interpretations", [])
     if not interpretations and word.get("interpretation"):
         interpretations = [l.strip() for l in word["interpretation"].split("\n") if l.strip()]
+    trans = "；".join(interpretations) if interpretations else word.get("interpretation", "")
 
-    for line in interpretations:
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(".", 1)
-        if len(parts) == 2 and len(parts[0]) <= 6:
-            definitions.append({
-                "pos": parts[0].strip() + ".",
-                "meaning": parts[1].strip()
-            })
-        else:
-            definitions.append({
-                "meaning": line
-            })
+    # 仅精选 1 条高频例句，单行呈现
+    example = ""
+    phrases = word.get("phrases", [])
+    if phrases:
+        p0 = phrases[0]
+        en = p0.get("en", "").strip()
+        cn = p0.get("cn", "").strip()
+        if en and cn:
+            example = f"{en} // {cn}"
+        elif en:
+            example = en
 
-    # 提取全部权威真题例句
-    examples = []
-    for idx, p in enumerate(word.get("phrases", [])):
-        examples.append({
-            "id": idx + 1,
-            "en": p.get("en", ""),
-            "cn": p.get("cn", ""),
-            "tags": p.get("tags", [])
-        })
-
-    # 助记笔记
-    notes = []
-    for n in word.get("notes", []):
-        t = n.get("title", "")
-        c = n.get("content", "")
-        if t or c:
-            notes.append({
-                "title": t,
-                "content": c
-            })
-
-    # 构造全面详尽的 JSON 响应
+    # 极简紧凑 JSON（仅核心字段，5-8 行，一屏即览，完全单色）
     data = {
-        "status": "resolved",
-        "code": 200,
-        "timestamp": int(time.time()),
-        "query": {
-            "symbol": spelling,
-            "phonetic": {
-                "us": f"/{phonetic_us}/" if phonetic_us else "",
-                "uk": f"/{phonetic_uk}/" if phonetic_uk else ""
-            },
-            "syllables": hyphenation,
-            "difficulty_level": difficulty
-        },
-        "definitions": definitions,
-        "examples": examples,
-        "notes": notes,
-        "session": {
-            "index": min(current, total) if total > 0 else current,
-            "total": total,
-            "remaining": max(0, total - current)
-        }
+        "word": spelling,
+        "phonetic": _clean_phonetic(ph),
+        "trans": trans,
+        "example": example,
+        "progress": f"{min(current, total)}/{total}" if total > 0 else str(current)
     }
 
-    # 序列化为规范 JSON 字符串
-    json_text = json.dumps(data, ensure_ascii=False, indent=2)
+    # 助记笔记（如有则紧凑保留）
+    notes = word.get("notes", [])
+    if notes:
+        n0 = notes[0]
+        c = n0.get("content", "").strip()
+        t = n0.get("title", "").strip()
+        if c:
+            data["note"] = f"[{t}] {c}" if t else c
 
-    # 保证字体 100% 没有任何颜色（无 ANSI 转义代码，关闭所有高亮与 markup）
+    json_text = json.dumps(data, ensure_ascii=False, indent=2)
     console.print(json_text, markup=False, highlight=False, style="none")
     console.print()
 
-    # 判答提示行也保持完全单色无色
     if hide_judge_hint:
         console.print("[h] show keys", markup=False, highlight=False, style="none")
     else:
-        console.print("[1] pass  [2] vague  [3] fail  [0] archive  |  [p] audio  [e] sentence  [t] accent  |  [u] undo  [/] search  [h] hide  [m] mode  [b] boss  [q] quit", markup=False, highlight=False, style="none")
+        console.print("[1] pass  [2] vague  [3] fail  [0] kill  |  [p] audio  [e] sentence  [t] accent  |  [u] undo  [/] search  [h] hide  [m] mode  [b] boss  [q] quit", markup=False, highlight=False, style="none")

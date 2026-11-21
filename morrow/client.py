@@ -9,6 +9,7 @@ import ssl
 import time
 import json
 import asyncio
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Optional, Dict, Any, List
@@ -299,6 +300,7 @@ class MorrowClient:
     def __init__(self, ws_token: str, rest_token: str = ""):
         self.ws_token = ws_token.strip()
         self.rest_token = rest_token.strip()
+        self.rest_auth_failed = False
         self.ws = None
         self._ssl_ctx = ssl.create_default_context()
 
@@ -552,6 +554,7 @@ class MorrowClient:
 
     def fetch_study_progress(self) -> Dict[str, int]:
         """通过开放 API 获取今日学习进度。"""
+        self.rest_auth_failed = False
         if not self.rest_token:
             return {}
         try:
@@ -566,6 +569,8 @@ class MorrowClient:
             finished, total = progress["finished"], progress["total"]
             if result.get("success") and type(finished) is int and type(total) is int and 0 <= finished <= total:
                 return {"finished": finished, "total": total}
+        except urllib.error.HTTPError as exc:
+            self.rest_auth_failed = exc.code in (401, 403)
         except (OSError, ValueError, KeyError, TypeError):
             pass
         return {}
