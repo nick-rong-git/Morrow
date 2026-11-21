@@ -1,7 +1,9 @@
 """
-Morrow 学习客户端 (Morrow Learning Client)
+Morrow 核心学习客户端 (Morrow Learning Client)
 封装与墨墨官方 WebSocket 网关与 REST API 的双向交互协议。
 """
+
+from __future__ import annotations
 
 import os
 import ssl
@@ -9,32 +11,52 @@ import time
 import json
 import asyncio
 import urllib.request
-import websockets
 from typing import Optional, Dict, Any, List
 
-# 墨墨官方 API 端点
-WS_URL = "wss://tc-apis.maimemo.com/webstudy"
+import websockets
+
+# ---------------------------------------------------------------------------
+# 协议常量
+# ---------------------------------------------------------------------------
+
+WS_URL = "wss://tc-apis.maimemo.com/study/ws/webstudy"
 REST_USER_INFO_URL = "https://tc-apis.maimemo.com/api/v1/user/info"
 
-# WebSocket 事件定义
+EV_SYSTEM_READY = 1
 EV_SYSTEM_PING = 2
-EV_SYSTEM_READY = 3
-EV_WEBSTUDY_INIT_STUDY = 1000
-EV_WEBSTUDY_GET_WORD = 1001
-EV_WEBSTUDY_SUBMIT_WORD = 1002
-EV_WEBSTUDY_ADD_WORDS = 1006
+EV_SYSTEM_SUBSCRIBE_TOPICS = 3
+EV_WEBSTUDY_INIT_STUDY = 1001
+EV_WEBSTUDY_GET_WORD = 1002
+EV_WEBSTUDY_SUBMIT_RESPONSE = 1003
+EV_WEBSTUDY_ADD_WORDS = 1011
 
-# 反作弊耗时上下限保护 (ms)
-MIN_DURATION_MS = 250
-MAX_DURATION_MS = 300000
+EVENT_NAMES: Dict[int, str] = {
+    1: "SYSTEM_READY",
+    2: "SYSTEM_PING",
+    3: "SYSTEM_SUBSCRIBE_TOPICS",
+    1001: "WEBSTUDY_INIT_STUDY",
+    1002: "WEBSTUDY_GET_WORD",
+    1003: "WEBSTUDY_SUBMIT_RESPONSE",
+    1011: "WEBSTUDY_ADD_WORDS",
+}
+
+# 学习反馈枚举
+STUDY_RESPONSE: Dict[str, int] = {
+    "FAMILIAR": 1,
+    "VAGUE": 2,
+    "FORGET": 3,
+    "WELL_FAMILIAR": 4,
+    "CANCEL_WELL_FAMILIAR": 5,
+    "RECOGNIZE": 1,
+    "FUZZY": 2,
+}
+STUDY_METHOD: Dict[str, int] = {"STUDY_EN_CN": 0, "STUDY_CN_EN": 1}
 
 # ---------------------------------------------------------------------------
-# Protobuf 底层编码与解码
+# Protobuf 编解码
 # ---------------------------------------------------------------------------
 
-def _encode_varint(v: int) -> bytes:
-    if v < 0:
-        v += 1 << 64
+def _enc_varint(v: int) -> bytes:
     out = bytearray()
     while True:
         b = v & 0x7F
@@ -43,82 +65,108 @@ def _encode_varint(v: int) -> bytes:
             out.append(b | 0x80)
         else:
             out.append(b)
-            break
-    return bytes(out)
+            return bytes(out)
 
-def _decode_varint(buf: bytes, offset: int):
-    val = 0
+def _enc_tag(field: int, wire: int) -> bytes:
+    return _enc_varint((field << 3) | wire)
+
+def _enc_string(field: int, s: str) -> bytes:
+    data = s.encode("utf-8")
+    return _enc_tag(field, 2) + _enc_varint(len(data)) + data
+
+def _enc_bytes(field: int, b: bytes) -> bytes:
+    return _enc_tag(field, 2) + _enc_varint(len(b)) + b
+
+def _enc_int32(field: int, v: int) -> bytes:
+    return _enc_tag(field, 0) + _enc_varint(v & 0xFFFFFFFFFFFFFFFF)
+
+def _enc_bool(field: int, v: bool) -> bytes:
+    return _enc_tag(field, 0) + _enc_varint(1 if v else 0)
+
+def _dec_varint(buf: bytes, pos: int):
+    result = 0
     shift = 0
-    idx = offset
-    while idx < len(buf):
-        b = buf[idx]
-        val |= (b & 0x7F) << shift
-        idx += 1
+    while pos < len(buf):
+        b = buf[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
         if not (b & 0x80):
-            return val, idx
+            break
         shift += 7
-        if shift > 64:
-            raise ValueError("Varint 溢出")
-    raise ValueError("Varint 截断")
+    return result, pos
 
-def _enc_field(num: int, wire: int, payload: bytes) -> bytes:
-    tag = (num << 3) | wire
-    return _encode_varint(tag) + payload
-
-def _enc_int32(num: int, val: int) -> bytes:
-    return _enc_field(num, 0, _encode_varint(val))
-
-def _enc_bool(num: int, val: bool) -> bytes:
-    return _enc_field(num, 0, _encode_varint(1 if val else 0))
-
-def _enc_string(num: int, s: str) -> bytes:
-    b = s.encode("utf-8")
-    return _enc_field(num, 2, _encode_varint(len(b)) + b)
-
-def _enc_bytes(num: int, b: bytes) -> bytes:
-    return _enc_field(num, 2, _encode_varint(len(b)) + b)
-
-def _decode_message(buf: bytes) -> Dict[int, List[Any]]:
-    fields: Dict[int, List[Any]] = {}
-    idx = 0
-    l = len(buf)
-    while idx < l:
-        tag, idx = _decode_varint(buf, idx)
-        fnum = tag >> 3
-        wire = tag & 0x7
+def _decode_message(buf: bytes) -> Dict[int, list]:
+    out: Dict[int, list] = {}
+    pos = 0
+    while pos < len(buf):
+        tag, pos = _dec_varint(buf, pos)
+        if tag == 0:
+            break
+        field, wire = tag >> 3, tag & 7
         if wire == 0:
-            val, idx = _decode_varint(buf, idx)
-            fields.setdefault(fnum, []).append(val)
+            val, pos = _dec_varint(buf, pos)
         elif wire == 2:
-            length, idx = _decode_varint(buf, idx)
-            val = buf[idx : idx + length]
-            idx += length
-            fields.setdefault(fnum, []).append(val)
+            length, pos = _dec_varint(buf, pos)
+            val = buf[pos:pos + length]
+            pos += length
+        elif wire == 1:
+            val = buf[pos:pos + 8]
+            pos += 8
+        elif wire == 5:
+            val = buf[pos:pos + 4]
+            pos += 4
         else:
             break
-    return fields
+        out.setdefault(field, []).append(val)
+    return out
 
-def _get_str(fields: Dict[int, List[Any]], fnum: int, default: str = "") -> str:
-    vals = fields.get(fnum)
-    if not vals:
+def _get_str(fields: Dict[int, list], num: int, default: str = "") -> str:
+    v = fields.get(num)
+    if not v:
         return default
-    v = vals[0]
-    return v.decode("utf-8", errors="replace") if isinstance(v, (bytes, bytearray)) else str(v)
+    raw = v[0]
+    return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
 
-def _get_int(fields: Dict[int, List[Any]], fnum: int, default: int = 0) -> int:
-    vals = fields.get(fnum)
-    return vals[0] if vals else default
+def _get_int(fields: Dict[int, list], num: int, default: int = 0) -> int:
+    v = fields.get(num)
+    return int(v[0]) if v else default
 
-def _get_bytes_list(fields: Dict[int, List[Any]], fnum: int) -> List[bytes]:
-    return [v for v in fields.get(fnum, []) if isinstance(v, (bytes, bytearray))]
-
+def _get_bytes_list(fields: Dict[int, list], num: int) -> List[bytes]:
+    return [v for v in fields.get(num, []) if isinstance(v, (bytes, bytearray))]
 
 def encode_envelope(msg_id: str, event: int, data: bytes = b"") -> bytes:
-    out = _enc_string(1, msg_id)
-    out += _enc_int32(3, event)
-    if data:
-        out += _enc_bytes(4, data)
+    return (
+        _enc_string(1, msg_id)
+        + _enc_int32(3, event)
+        + _enc_bytes(4, data)
+        + _enc_bool(5, True)
+    )
+
+def encode_get_word_request(back: bool) -> bytes:
+    return _enc_bool(1, True) if back else b""
+
+def encode_submit_request(
+    voc_id: str, response: str, study_method: str,
+    recall_duration: int, study_duration: int,
+) -> bytes:
+    out = b""
+    if voc_id:
+        out += _enc_string(1, voc_id)
+    resp_n = STUDY_RESPONSE.get(response, 1)
+    if resp_n:
+        out += _enc_int32(2, resp_n)
+    sm_n = STUDY_METHOD.get(study_method, 0)
+    if sm_n:
+        out += _enc_int32(3, sm_n)
+    if recall_duration:
+        out += _enc_int32(4, recall_duration)
+    if study_duration:
+        out += _enc_int32(5, study_duration)
     return out
+
+def encode_add_words_request(count: int, mode: int = 2) -> bytes:
+    inner = _enc_int32(1, count) + _enc_int32(2, mode)
+    return _enc_bytes(2, inner)
 
 def parse_envelope(buf: bytes) -> Dict[str, Any]:
     f = _decode_message(buf)
@@ -385,7 +433,7 @@ class MorrowClient:
         return env is not None and env.get("success", False)
 
     async def get_word(self, back: bool = False) -> Optional[Dict[str, Any]]:
-        data = _enc_bool(1, back)
+        data = encode_get_word_request(back)
         env = await self._request(EV_WEBSTUDY_GET_WORD, data, timeout=10)
         if env is None:
             return None
@@ -399,60 +447,58 @@ class MorrowClient:
     async def submit_response(
         self,
         word_id: str,
-        result: str,
-        sm_n: int = 0,
-        recall_duration: int = 0,
-        study_duration: int = 0,
+        response: str = "FAMILIAR",
+        recall_duration: int = 1000,
+        study_duration: int = 2000,
+        study_method: str = "STUDY_CN_EN",
     ) -> bool:
+        MIN_DURATION_MS = 300
+        recall_duration = max(recall_duration, MIN_DURATION_MS)
+        study_duration = max(study_duration, MIN_DURATION_MS)
+
         if self._last_word_received_at is not None:
-            now = time.monotonic()
-            elapsed_ms = int((now - self._last_word_received_at) * 1000)
-            if recall_duration > elapsed_ms:
-                recall_duration = max(MIN_DURATION_MS, elapsed_ms)
-            if study_duration > elapsed_ms:
-                study_duration = max(MIN_DURATION_MS, elapsed_ms)
+            elapsed_ms = int((time.monotonic() - self._last_word_received_at) * 1000)
+            budget_ms = max(0, elapsed_ms - 100)
+            total = recall_duration + study_duration
+            if total > budget_ms and total > 0:
+                ratio = budget_ms / total
+                recall_duration = max(MIN_DURATION_MS, int(recall_duration * ratio))
+                study_duration = max(MIN_DURATION_MS, int(study_duration * ratio))
+                if recall_duration + study_duration > budget_ms:
+                    need_ms = (recall_duration + study_duration) - budget_ms
+                    await asyncio.sleep(need_ms / 1000)
 
-        recall_duration = max(MIN_DURATION_MS, min(MAX_DURATION_MS, recall_duration))
-        study_duration = max(MIN_DURATION_MS, min(MAX_DURATION_MS, study_duration))
-
-        # 构造 Submit Request
-        body = _enc_string(1, word_id) + _enc_string(2, result)
-        if sm_n:
-            body += _enc_int32(3, sm_n)
-        if recall_duration:
-            body += _enc_int32(4, recall_duration)
-        if study_duration:
-            body += _enc_int32(5, study_duration)
-
-        env = await self._request(EV_WEBSTUDY_SUBMIT_WORD, body, timeout=15)
-        if env is None or not env.get("success"):
+        data = encode_submit_request(
+            voc_id=word_id,
+            response=response,
+            study_method=study_method,
+            recall_duration=recall_duration,
+            study_duration=study_duration,
+        )
+        env = await self._request(EV_WEBSTUDY_SUBMIT_RESPONSE, data, timeout=10)
+        if env is None:
+            self.last_error = "SUBMIT_RESPONSE 超时未收到响应"
             return False
+        if not env.get("success", True):
+            self.last_error = f"服务端拒绝 SUBMIT_RESPONSE: {env.get('errors')}"
+            self.last_next_word = None
+            return False
+        self.last_error = ""
 
-        # 解析返回包含的下一个词与进度
-        self.last_next_word = None
-        data = env.get("data", b"")
-        if data:
-            f = _decode_message(data)
-            prog_bufs = _get_bytes_list(f, 22)
-            if prog_bufs:
-                pf = _decode_message(prog_bufs[0])
-                self.progress = {
-                    "finished": _get_int(pf, 1),
-                    "total": _get_int(pf, 2),
-                }
-            next_word_bufs = _get_bytes_list(f, 21)
-            if next_word_bufs:
-                self.last_next_word = parse_get_word_response(next_word_bufs[0])
-                if self.last_next_word.get("id"):
-                    self._last_word_received_at = time.monotonic()
-
+        body = _decode_message(env.get("data", b""))
+        next_bufs = _get_bytes_list(body, 1)
+        self.last_next_word = parse_get_word_response(next_bufs[0]) if next_bufs else None
+        if self.last_next_word and self.last_next_word.get("id"):
+            self._last_word_received_at = time.monotonic()
+        if self.last_next_word and self.last_next_word.get("progress"):
+            self.progress = self.last_next_word["progress"]
         return True
 
     async def add_words(self, count: int, mode: int = 2) -> Optional[int]:
         if count <= 0:
             return 0
-        inner = _enc_int32(1, count) + _enc_int32(2, mode)
-        env = await self._request(EV_WEBSTUDY_ADD_WORDS, _enc_bytes(2, inner), timeout=15)
+        data = encode_add_words_request(count, mode)
+        env = await self._request(EV_WEBSTUDY_ADD_WORDS, data, timeout=15)
         if env is None or not env.get("success"):
             return None
         f = _decode_message(env.get("data", b""))
