@@ -130,7 +130,7 @@ class AsyncRegressions(unittest.IsolatedAsyncioTestCase):
     async def test_unix_standalone_escape_is_returned_after_filtering_sequences(self):
         fd = 5
         ready, idle = ([fd], [], []), ([], [], [])
-        select = Mock(select=Mock(side_effect=[ready, ready, ready, ready, idle, ready, idle]))
+        select = Mock(select=Mock(side_effect=[ready, ready, ready, ready, ready, idle]))
         tty = Mock()
         termios = Mock(TCSADRAIN=1, tcgetattr=Mock(return_value="original"))
         stdin = Mock(isatty=Mock(return_value=True), fileno=Mock(return_value=fd))
@@ -142,6 +142,53 @@ class AsyncRegressions(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertEqual(await cli.async_read_key(), "\x1b")
         termios.tcsetattr.assert_called_once_with(fd, termios.TCSADRAIN, "original")
+
+    async def test_windows_scroll_keys_are_read_without_triggering_other_commands(self):
+        keyboard = Mock(kbhit=Mock(return_value=True), getwch=Mock(side_effect=["\xe0", "P", "\x00", "I"]))
+        with (
+            patch.object(cli.sys, "stdin", Mock(isatty=Mock(return_value=True))),
+            patch.object(cli.sys, "platform", "win32"),
+            patch.dict(cli.sys.modules, {"msvcrt": keyboard}),
+        ):
+            self.assertEqual(await cli.async_read_key(), "down")
+            self.assertEqual(await cli.async_read_key(), "page_up")
+
+    async def test_long_answer_scrolls_and_next_word_starts_at_the_top(self):
+        word = {
+            "id": "greet", "spelling": "greet", "interpretation": "v. 问候；迎接",
+            "notes": [{"content": "\n".join(f"助记内容 {i:02}" for i in range(40))}],
+        }
+        next_word = {"id": "welcome", "spelling": "welcome", "interpretation": "v. 欢迎"}
+        client = Mock(progress={}, get_word=AsyncMock(return_value=word),
+                      last_next_word=next_word, submit_response=AsyncMock(return_value=True))
+        console = Console(file=self.buffer, width=90, height=16, force_terminal=True,
+                          legacy_windows=False, color_system=None, _environ={})
+        keys = iter([" ", "page_down", "page_down", "page_down", "page_down",
+                     "page_up", "page_up", "page_up", "page_up", "page_down", "1", " ", "q"])
+        frames = []
+
+        async def read_key():
+            frames.append(self.buffer.getvalue().rsplit("\x1b[H", 1)[-1])
+            return next(keys)
+
+        with (
+            console.screen(hide_cursor=False),
+            patch.object(cli, "async_read_key", read_key),
+            patch.object(cli, "audio_engine"),
+        ):
+            await cli.run_learning_session(client, self.config, console)
+
+        self.assertIn("问候；迎接", frames[1])
+        self.assertIn("PgUp/PgDn", frames[1])
+        self.assertNotIn("助记内容 39", frames[1])
+        self.assertIn("助记内容 39", frames[5])
+        self.assertIn("[1] 认识", frames[5])
+        self.assertEqual(frames[1], frames[9])
+        self.assertNotIn("问候；迎接", frames[10])
+        self.assertIn("welcome", frames[11])
+        self.assertIn("欢迎", frames[12])
+        self.assertTrue(all(len(frame.splitlines()) < console.height for frame in frames))
+        client.submit_response.assert_awaited_once()
 
     async def test_disguise_example_keys_play_the_displayed_sentences(self):
         self.config.set("ui_mode", "disguise")

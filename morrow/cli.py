@@ -14,6 +14,7 @@ from .audio import audio_engine
 from .client import MorrowClient
 from .config import Config
 from .terminal import terminal_session
+from .ui.viewport import CardViewport
 from .ui import (
     EXAMPLE_KEYS,
     get_study_examples,
@@ -36,6 +37,11 @@ JUDGMENTS = {
     "3": ("FORGET", "forgot"), "l": ("FORGET", "forgot"),
     "0": ("WELL_FAMILIAR", "mastered"), "z": ("WELL_FAMILIAR", "mastered"),
 }
+WINDOWS_SCROLL_KEYS = {"H": "up", "P": "down", "I": "page_up", "Q": "page_down"}
+ANSI_SCROLL_KEYS = {
+    b"[A": "up", b"[B": "down", b"OA": "up", b"OB": "down",
+    b"[5~": "page_up", b"[6~": "page_down",
+}
 
 
 class StudyError(Exception):
@@ -56,7 +62,9 @@ async def async_read_key() -> str:
             if msvcrt.kbhit():
                 key = msvcrt.getwch()
                 if key in ("\x00", "\xe0"):
-                    msvcrt.getwch()
+                    scroll_key = WINDOWS_SCROLL_KEYS.get(msvcrt.getwch())
+                    if scroll_key:
+                        return scroll_key
                 elif key == "\x03":
                     raise KeyboardInterrupt
                 else:
@@ -78,9 +86,15 @@ async def async_read_key() -> str:
                     raise EOFError
                 if key != b"\x1b" or not select.select([fd], [], [], 0.025)[0]:
                     return key.decode("ascii", errors="replace")
-                # 单独的 Esc 已返回，继续消费方向键等转义序列。
-                while os.read(fd, 1) and select.select([fd], [], [], 0.025)[0]:
-                    pass
+                sequence = os.read(fd, 1)
+                if sequence in (b"[", b"O"):
+                    while select.select([fd], [], [], 0.025)[0]:
+                        part = os.read(fd, 1)
+                        sequence += part
+                        if not part or b"@" <= part <= b"~":
+                            break
+                if sequence in ANSI_SCROLL_KEYS:
+                    return ANSI_SCROLL_KEYS[sequence]
             await asyncio.sleep(0.025)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
@@ -125,6 +139,8 @@ async def run_learning_session(
             show_completion_screen(console, stats)
             key = await _read_command(console)
             if key == "q":
+                if not console.is_alt_screen:
+                    console.print(Text("\n[已退出学习]", style="dim #6272a4"))
                 return
             if key == "r" and await show_advance_review_modal(console, client):
                 word = await _get_word(client)
@@ -139,7 +155,7 @@ async def run_learning_session(
         judge_start = None
         recall_ms = 0
         reveal_audio = False
-        feedback = ""
+        viewport = CardViewport()
         audio_engine.stop()
         if word_audio_timing == "recall":
             play_word_sound(word, accent)
@@ -150,13 +166,12 @@ async def run_learning_session(
             answered = judge_start is not None
             if ui_mode == "study":
                 render = render_study_answer_card if answered else render_study_recall_card
-                render(console, word, finished, total, accent=accent, hide_judge_hint=config.hide_judge_hint)
+                render(console, word, finished, total, accent=accent,
+                       hide_judge_hint=config.hide_judge_hint, viewport=viewport)
             else:
                 render = render_disguise_answer_panel if answered else render_disguise_recall_panel
-                render(console, word, finished + 1, total, config.hide_judge_hint)
-            if feedback:
-                console.print(Text(feedback, style="bold #f1fa8c"))
-                feedback = ""
+                render(console, word, finished + 1, total, config.hide_judge_hint, viewport=viewport)
+            viewport.feedback = ""
 
             if reveal_audio:
                 reveal_audio = False
@@ -168,11 +183,12 @@ async def run_learning_session(
 
             key = await _read_command(console)
             if key == "q":
-                console.print(Text("\n[已退出学习]", style="dim #6272a4"))
                 return
+            elif key in ("up", "down", "page_up", "page_down"):
+                viewport.scroll(key)
             elif key == "h":
                 if not config.update(hide_judge_hint=not config.hide_judge_hint):
-                    feedback = "无法保存提示栏设置。"
+                    viewport.feedback = "无法保存提示栏设置。"
             elif key == "p":
                 play_word_sound(word, accent)
             elif key == "t":
@@ -183,12 +199,13 @@ async def run_learning_session(
                     audio_engine.prefetch_sentence(phrase, accent=accent)
             elif key == "m":
                 ui_mode = "disguise" if ui_mode == "study" else "study"
+                viewport.top = 0
             elif key in ("u", "\x08", "\x7f"):
                 previous = await client.get_word(back=True)
                 if previous is None:
                     if not client.last_request_rejected:
                         raise StudyError(f"{client.last_error or '连接中断'}。撤回结果未确认，请重新进入学习并同步进度。")
-                    feedback = client.last_error or "无法撤回判答"
+                    viewport.feedback = client.last_error or "无法撤回判答"
                 elif previous.get("id"):
                     if history and history[-1][0] == previous["id"]:
                         _, category = history.pop()
@@ -197,7 +214,7 @@ async def run_learning_session(
                     word = previous
                     break
                 else:
-                    feedback = "没有可撤回的单词。"
+                    viewport.feedback = "没有可撤回的单词。"
             elif key in ("/", "d"):
                 await show_dictionary_modal(console)
                 if answered:
@@ -211,6 +228,7 @@ async def run_learning_session(
                     judge_start = time.monotonic()
                     recall_ms = int((judge_start - recall_start) * 1000)
                     reveal_audio = True
+                    viewport.top = 0
             elif answered and (key == "e" or key in EXAMPLE_KEYS):
                 index = 0 if key == "e" else EXAMPLE_KEYS.index(key)
                 if index < len(phrases):
@@ -224,7 +242,7 @@ async def run_learning_session(
                 )
                 if not ok:
                     if client.last_request_rejected:
-                        feedback = client.last_error or "判答未保存，请重试。"
+                        viewport.feedback = client.last_error or "判答未保存，请重试。"
                         continue
                     raise StudyError(f"{client.last_error or '连接中断'}。判答结果未确认，请重新进入学习并同步进度。")
                 history.append((word["id"], category))

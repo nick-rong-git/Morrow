@@ -7,7 +7,7 @@ Morrow 核心卡片渲染引擎 (Cards Engine)
 
 import json
 from typing import Any, Dict, Iterator, List
-from rich.console import Console
+from rich.console import Console, Group
 from rich.text import Text
 from rich.panel import Panel
 from rich.table import Table
@@ -18,6 +18,7 @@ from .theme import (
     CARD_BOX, STYLE_HIGHLIGHT
 )
 from .components import render_progress_bar, render_judge_hotkeys, render_recall_hotkeys
+from .viewport import CardViewport, draw_card
 
 PARTS_OF_SPEECH = {
     "a", "abbr", "ad", "adj", "adv", "art", "aux", "conj", "det", "int", "interj",
@@ -56,14 +57,10 @@ def render_study_recall_card(
     total: int,
     streak: int | None = None,
     accent: str = "US",
-    hide_judge_hint: bool = False
+    hide_judge_hint: bool = False,
+    *,
+    viewport: CardViewport | None = None,
 ) -> None:
-    console.clear()
-    
-    # 顶部进度
-    console.print(render_progress_bar(current, total, streak))
-    console.print()
-
     # 主词卡
     spelling = word.get("spelling", "")
     phonetic_accent = accent if word.get(f"phonetic_{accent.lower()}") else ("US" if word.get("phonetic_us") else "UK")
@@ -93,12 +90,8 @@ def render_study_recall_card(
         border_style=COLOR_PRIMARY,
         padding=(1, 2)
     )
-    console.print(panel)
-    console.print()
-    if not hide_judge_hint:
-        console.print(render_recall_hotkeys())
-    else:
-        console.print(Text("  [h] 显示提示", style="dim #44475a"))
+    hint = Text("  [h] 显示提示", style="dim #44475a") if hide_judge_hint else render_recall_hotkeys()
+    draw_card(console, Group(render_progress_bar(current, total, streak), Text(), panel), hint, viewport)
 
 
 # ============================================================================
@@ -112,14 +105,10 @@ def render_study_answer_card(
     total: int,
     streak: int | None = None,
     accent: str = "US",
-    hide_judge_hint: bool = False
+    hide_judge_hint: bool = False,
+    *,
+    viewport: CardViewport | None = None,
 ) -> None:
-    console.clear()
-    
-    # 顶部进度
-    console.print(render_progress_bar(current, total, streak))
-    console.print()
-
     # 1. 词头与发音信息
     spelling = word.get("spelling", "")
     phonetic_us = word.get("phonetic_us", "")
@@ -225,13 +214,8 @@ def render_study_answer_card(
         border_style=COLOR_PRIMARY,
         padding=(1, 2)
     )
-    console.print(panel)
-    console.print()
-
-    if not hide_judge_hint:
-        console.print(render_judge_hotkeys())
-    else:
-        console.print(Text("  [h] 显示提示", style="dim #44475a"))
+    hint = Text("  [h] 显示提示", style="dim #44475a") if hide_judge_hint else render_judge_hotkeys()
+    draw_card(console, Group(render_progress_bar(current, total, streak), Text(), panel), hint, viewport)
 
 
 # ============================================================================
@@ -251,8 +235,9 @@ def render_disguise_recall_panel(
     current: int,
     total: int,
     hide_judge_hint: bool = False,
+    *,
+    viewport: CardViewport | None = None,
 ) -> None:
-    console.clear()
     spelling = word.get("spelling", "")
     ph = word.get("phonetic_us") or word.get("phonetic_uk") or ""
 
@@ -263,14 +248,10 @@ def render_disguise_recall_panel(
         "progress": f"{min(current, total)}/{total}" if total > 0 else str(current)
     }
 
-    json_text = json.dumps(data, ensure_ascii=False, indent=2)
-    console.print(json_text, markup=False, highlight=False, style="none")
-    console.print()
-
-    if hide_judge_hint:
-        console.print("[h] show keys", markup=False, highlight=False, style="none")
-    else:
-        console.print("[Enter/Space] view  [p] audio  [t] accent  [u] undo  [/] lookup  [h] hide  [m] mode  [Esc/b] boss  [q] quit", markup=False, highlight=False, style="none")
+    hint = "[h] show keys" if hide_judge_hint else (
+        "[Enter/Space] view  [p] audio  [t] accent  [u] undo  [/] lookup  [h] hide  [m] mode  [Esc/b] boss  [q] quit"
+    )
+    draw_card(console, Text(json.dumps(data, ensure_ascii=False, indent=2)), Text(hint), viewport)
 
 
 def render_disguise_answer_panel(
@@ -279,8 +260,9 @@ def render_disguise_answer_panel(
     current: int,
     total: int,
     hide_judge_hint: bool = False,
+    *,
+    viewport: CardViewport | None = None,
 ) -> None:
-    console.clear()
     spelling = word.get("spelling", "")
     ph = word.get("phonetic_us") or word.get("phonetic_uk") or ""
 
@@ -308,17 +290,13 @@ def render_disguise_answer_panel(
         if c:
             data["note"] = f"[{t}] {c}" if t else c
 
-    json_text = json.dumps(data, ensure_ascii=False, indent=2)
-    console.print(json_text, markup=False, highlight=False, style="none", soft_wrap=True)
-    console.print()
-
     if hide_judge_hint:
-        console.print("[h] show keys", markup=False, highlight=False, style="none")
+        hint = "[h] show keys"
     else:
         keys = "/".join(EXAMPLE_KEYS[:len(examples)])
         example_hint = f"  [e] first  [{keys}] examples" if keys else ""
-        console.print(
+        hint = (
             f"[1] pass  [2] vague  [3] fail  [0] kill  |  [Enter/Space/p] replay word{example_hint}  [t] accent  |  "
-            "[u] undo  [/] search  [h] hide  [m] mode  [Esc/b] boss  [q] quit",
-            markup=False, highlight=False, style="none",
+            "[u] undo  [/] search  [h] hide  [m] mode  [Esc/b] boss  [q] quit"
         )
+    draw_card(console, Text(json.dumps(data, ensure_ascii=False, indent=2)), Text(hint), viewport, soft_wrap=True)
