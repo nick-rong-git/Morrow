@@ -225,6 +225,8 @@ class AsyncRegressions(unittest.IsolatedAsyncioTestCase):
                 audio = Mock()
 
                 async def read_key():
+                    if not play_counts:
+                        audio.prefetch_word.assert_called_once_with(word["audio_uk"], fallback_text="company", accent="US")
                     play_counts.append(audio.play_word.call_count)
                     return next(keys)
 
@@ -235,6 +237,10 @@ class AsyncRegressions(unittest.IsolatedAsyncioTestCase):
                 with patch.object(cli, "async_read_key", read_key), patch.object(cli, "audio_engine", audio):
                     await cli.run_learning_session(client, self.config, self.console)
                 self.assertEqual(play_counts, [0, 0, 1, 2, 3])
+                self.assertEqual(audio.prefetch_word.call_args_list, [
+                    call(word["audio_uk"], fallback_text="company", accent="US"),
+                    call(word["audio_uk"], fallback_text="company", accent="UK"),
+                ])
                 self.assertEqual(audio.play_word.call_args_list, [
                     call(word["audio_uk"], fallback_text="company", accent="UK", example=""),
                 ] * 3)
@@ -659,6 +665,50 @@ class StorageRegressions(unittest.TestCase):
             self.assertIsNotNone(results[0])
             self.assertEqual(results, [results[0]] * 6)
             self.assertEqual(list(Path(directory).iterdir()), [Path(results[0])])
+
+    def test_word_prefetch_prepares_official_or_fallback_audio_for_playback(self):
+        url = "https://example.invalid/greet.mp3"
+        sample = b"ID3" + b"x" * 400
+        for official_available in (True, False):
+            with self.subTest(official_available=official_available), TemporaryDirectory() as directory:
+                audio = AudioEngine(directory)
+                audio._winmm = Mock()
+                started = threading.Event()
+                finish_download = threading.Event()
+
+                def download(actual_url, path):
+                    started.set()
+                    if not finish_download.wait(timeout=3) or not official_available:
+                        return False
+                    Path(path).write_bytes(sample)
+                    return True
+
+                def synthesize(text, accent, path):
+                    Path(path).write_bytes(sample)
+                    return True
+
+                with (
+                    patch.object(audio, "_download", side_effect=download) as fetch,
+                    patch.object(audio, "_synth_sentence", side_effect=synthesize) as synth,
+                    patch.object(audio, "_play_file_sync", return_value=True) as play,
+                    ThreadPoolExecutor(max_workers=1) as pool,
+                ):
+                    audio.prefetch_word(url, fallback_text="greet", accent="UK")
+                    try:
+                        self.assertTrue(started.wait(timeout=2))
+                        play.assert_not_called()
+                        playback = pool.submit(audio.play_word, url, False, fallback_text="greet", accent="UK")
+                    finally:
+                        finish_download.set()
+                    playback.result(timeout=3)
+                    audio.play_word(url, False, fallback_text="greet", accent="UK")
+
+                fetch.assert_called_once()
+                self.assertEqual(synth.call_count, 0 if official_available else 1)
+                self.assertEqual(play.call_count, 2)
+                first_file = play.call_args_list[0].args[0]
+                self.assertEqual(first_file, play.call_args_list[1].args[0])
+                self.assertEqual(Path(first_file).read_bytes(), sample)
 
     def test_playback_sequences_example_after_word_and_respects_cancellation(self):
         audio = AudioEngine()

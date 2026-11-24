@@ -110,10 +110,13 @@ async def _read_command(console: Console) -> str:
     return key
 
 
-def play_word_sound(word: Dict[str, Any], accent: str, *, example: str = "") -> None:
+def word_audio_url(word: Dict[str, Any], accent: str) -> str:
     speeches = word.get("speeches", {})
-    url = speeches.get(accent) or word.get(f"audio_{accent.lower()}") or word.get("audio_us") or word.get("audio_uk")
-    audio_engine.play_word(url or "", fallback_text=word.get("spelling", ""), accent=accent, example=example)
+    return speeches.get(accent) or word.get(f"audio_{accent.lower()}") or word.get("audio_us") or word.get("audio_uk") or ""
+
+
+def play_word_sound(word: Dict[str, Any], accent: str, *, example: str = "") -> None:
+    audio_engine.play_word(word_audio_url(word, accent), fallback_text=word.get("spelling", ""), accent=accent, example=example)
 
 
 async def _get_word(client: MorrowClient) -> Dict[str, Any]:
@@ -157,6 +160,7 @@ async def run_learning_session(
         reveal_audio = False
         viewport = CardViewport()
         audio_engine.stop()
+        audio_engine.prefetch_word(word_audio_url(word, accent), fallback_text=word.get("spelling", ""), accent=accent)
         if word_audio_timing == "recall":
             play_word_sound(word, accent)
         for phrase in phrases:
@@ -193,6 +197,7 @@ async def run_learning_session(
                 play_word_sound(word, accent)
             elif key == "t":
                 accent = "UK" if accent == "US" else "US"
+                audio_engine.prefetch_word(word_audio_url(word, accent), fallback_text=word.get("spelling", ""), accent=accent)
                 if answered:
                     play_word_sound(word, accent)
                 for phrase in phrases:

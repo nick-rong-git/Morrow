@@ -39,6 +39,8 @@ class AudioEngine:
         self._cancelled = threading.Event()
         self._downloads = {}
         self._prefetch_slots = threading.BoundedSemaphore(3)
+        self._word_prefetch_slots = threading.BoundedSemaphore(2)
+        self._word_prefetch: tuple[tuple[str, str, str], Future[str | None]] | None = None
         self._winmm = ctypes.windll.winmm if sys.platform == "win32" else None
 
     def _cache_path(self, key: str) -> str:
@@ -160,14 +162,57 @@ class AudioEngine:
     ) -> None:
         example = example.strip()
         if url or fallback_text or example:
-            self._play(self._play_word_sync, (url, fallback_text, accent, example), async_play)
+            self._play(self._play_word_sync, (url, fallback_text, accent.upper(), example), async_play)
+
+    def prefetch_word(self, url: str, *, fallback_text: str = "", accent: str = "US") -> None:
+        if self._winmm is None or not (url or fallback_text):
+            return
+        accent = accent.upper()
+        key = (url, fallback_text, accent)
+        with self._lock:
+            if self._word_prefetch is not None and self._word_prefetch[0] == key:
+                return
+            # Word audio gets its own slots so sentence prefetches can't delay it.
+            if not self._word_prefetch_slots.acquire(blocking=False):
+                return
+            prepared = Future()
+            self._word_prefetch = (key, prepared)
+
+        def prepare():
+            path = None
+            try:
+                path = self.download_url_if_needed(url)
+                if path is None and fallback_text:
+                    path = self._ensure_sentence_mp3(fallback_text, accent)
+            finally:
+                prepared.set_result(path)
+                self._word_prefetch_slots.release()
+
+        try:
+            threading.Thread(target=prepare, daemon=True).start()
+        except RuntimeError:
+            prepared.set_result(None)
+            self._word_prefetch_slots.release()
 
     def _play_word_sync(self, url, fallback_text, accent, example, cancelled) -> None:
         if cancelled.is_set():
             return
-        path = self.download_url_if_needed(url)
+        with self._lock:
+            prefetch = self._word_prefetch
+        if prefetch is not None and prefetch[0] == (url, fallback_text, accent):
+            path = prefetch[1].result()
+            if path is None:
+                # Use the local voice now and allow the next replay to retry.
+                with self._lock:
+                    if self._word_prefetch is prefetch:
+                        self._word_prefetch = None
+                if fallback_text and not cancelled.is_set():
+                    self._sapi_fallback(fallback_text, cancelled)
+        else:
+            prefetch = None
+            path = self.download_url_if_needed(url)
         played = path is not None and self._play_file_sync(path, cancelled)
-        if not played and fallback_text and not cancelled.is_set():
+        if not played and (path or prefetch is None) and fallback_text and not cancelled.is_set():
             self._speak_sentence_sync(fallback_text, accent, cancelled)
         if example and not cancelled.is_set():
             self._speak_sentence_sync(example, accent, cancelled)
