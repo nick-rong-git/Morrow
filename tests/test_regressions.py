@@ -710,6 +710,48 @@ class StorageRegressions(unittest.TestCase):
                 self.assertEqual(first_file, play.call_args_list[1].args[0])
                 self.assertEqual(Path(first_file).read_bytes(), sample)
 
+    def test_word_replay_reuses_the_decoded_sound_and_open_channel(self):
+        audio = AudioEngine()
+        audio._winmm = Mock()
+        decoded = threading.Event()
+        sound = object()
+        channel = Mock(get_busy=Mock(return_value=False))
+        mixer = Mock(Channel=Mock(return_value=channel))
+
+        def decode(*, file):
+            self.assertEqual(file, "word.mp3")
+            decoded.set()
+            return sound
+
+        mixer.Sound.side_effect = decode
+        example = Mock()
+        url = "https://example.invalid/word.mp3"
+        with (
+            patch.dict(cli.sys.modules, {"pygame": Mock(error=RuntimeError, mixer=mixer)}),
+            patch.object(audio, "download_url_if_needed", return_value="word.mp3") as download,
+            patch.object(audio, "_play_file_sync") as legacy_play,
+            patch.object(audio, "_speak_sentence_sync", example),
+            audio.word_output(),
+        ):
+            order = Mock()
+            order.attach_mock(channel.play, "play")
+            order.attach_mock(example, "example")
+            audio.prefetch_word(url, fallback_text="word")
+            self.assertTrue(decoded.wait(timeout=2))
+            channel.play.assert_not_called()
+
+            audio.play_word(url, async_play=False, fallback_text="word", example="A word.")
+            cancelled = audio._cancelled
+            audio.play_word(url, async_play=False, fallback_text="word")
+
+        self.assertEqual(order.mock_calls, [call.play(sound), call.example("A word.", "US", cancelled), call.play(sound)])
+        legacy_play.assert_not_called()
+        download.assert_called_once_with(url)
+        mixer.Sound.assert_called_once_with(file="word.mp3")
+        mixer.init.assert_called_once()
+        mixer.Channel.assert_called_once_with(0)
+        mixer.quit.assert_called_once()
+
     def test_playback_sequences_example_after_word_and_respects_cancellation(self):
         audio = AudioEngine()
         audio._winmm = Mock()

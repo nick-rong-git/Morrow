@@ -1,7 +1,10 @@
 """单词和例句的音频缓存、预取与 Windows 播放。"""
 
+from __future__ import annotations
+
 import asyncio
 from concurrent.futures import Future
+from contextlib import contextmanager
 import ctypes
 import hashlib
 from http.client import HTTPException
@@ -9,9 +12,12 @@ import os
 import sys
 from tempfile import NamedTemporaryFile
 import threading
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 import urllib.parse
 import urllib.request
+
+if TYPE_CHECKING:
+    from pygame.mixer import Channel, Sound
 
 try:
     import edge_tts
@@ -36,11 +42,13 @@ class AudioEngine:
         self.cache_dir = cache_dir
         self._lock = threading.Lock()
         self._play_lock = threading.Lock()
+        self._output_lock = threading.Lock()
         self._cancelled = threading.Event()
         self._downloads = {}
         self._prefetch_slots = threading.BoundedSemaphore(3)
         self._word_prefetch_slots = threading.BoundedSemaphore(2)
-        self._word_prefetch: tuple[tuple[str, str, str], Future[str | None]] | None = None
+        self._word_prefetch: tuple[tuple[str, str, str], Future[tuple[str | None, Sound | None]]] | None = None
+        self._word_channel: Channel | None = None
         self._winmm = ctypes.windll.winmm if sys.platform == "win32" else None
 
     def _cache_path(self, key: str) -> str:
@@ -146,6 +154,66 @@ class AudioEngine:
         with self._lock:
             self._cancelled.set()
 
+    @contextmanager
+    def word_output(self):
+        """Keep one mixer channel open for the study session."""
+        if self._winmm is None:
+            yield
+            return
+
+        os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+        try:
+            from pygame import error, mixer
+        except ImportError:
+            yield
+            return
+
+        with self._play_lock, self._output_lock:
+            try:
+                mixer.init(buffer=512)
+                self._word_channel = mixer.Channel(0)
+            except error:
+                mixer.quit()
+
+        try:
+            yield
+        finally:
+            self.stop()
+            with self._play_lock, self._output_lock:
+                if self._word_channel is not None:
+                    self._word_channel = None
+                    mixer.quit()
+            with self._lock:
+                self._word_prefetch = None
+
+    def _decode_word(self, path: str | None) -> Sound | None:
+        with self._output_lock:
+            if path is None or self._word_channel is None:
+                return None
+            from pygame import error, mixer
+
+            try:
+                return mixer.Sound(file=path)
+            except (error, OSError):
+                return None
+
+    def _play_decoded_word(self, sound: Sound, cancelled: threading.Event) -> bool:
+        with self._play_lock:
+            channel = self._word_channel
+            if channel is None or cancelled.is_set():
+                return False
+            from pygame import error
+
+            try:
+                channel.play(sound)
+                while channel.get_busy():
+                    if cancelled.wait(0.01):
+                        channel.stop()
+                        break
+            except error:
+                return False
+            return True
+
     def _play(self, worker, args: tuple, background: bool) -> None:
         if self._winmm is None:
             return
@@ -179,19 +247,20 @@ class AudioEngine:
             self._word_prefetch = (key, prepared)
 
         def prepare():
-            path = None
+            path, sound = None, None
             try:
                 path = self.download_url_if_needed(url)
                 if path is None and fallback_text:
                     path = self._ensure_sentence_mp3(fallback_text, accent)
+                sound = self._decode_word(path)
             finally:
-                prepared.set_result(path)
+                prepared.set_result((path, sound))
                 self._word_prefetch_slots.release()
 
         try:
             threading.Thread(target=prepare, daemon=True).start()
         except RuntimeError:
-            prepared.set_result(None)
+            prepared.set_result((None, None))
             self._word_prefetch_slots.release()
 
     def _play_word_sync(self, url, fallback_text, accent, example, cancelled) -> None:
@@ -200,7 +269,7 @@ class AudioEngine:
         with self._lock:
             prefetch = self._word_prefetch
         if prefetch is not None and prefetch[0] == (url, fallback_text, accent):
-            path = prefetch[1].result()
+            path, sound = prefetch[1].result()
             if path is None:
                 # Use the local voice now and allow the next replay to retry.
                 with self._lock:
@@ -211,7 +280,10 @@ class AudioEngine:
         else:
             prefetch = None
             path = self.download_url_if_needed(url)
-        played = path is not None and self._play_file_sync(path, cancelled)
+            sound = self._decode_word(path)
+        played = sound is not None and self._play_decoded_word(sound, cancelled)
+        if not played and path is not None and not cancelled.is_set():
+            played = self._play_file_sync(path, cancelled)
         if not played and (path or prefetch is None) and fallback_text and not cancelled.is_set():
             self._speak_sentence_sync(fallback_text, accent, cancelled)
         if example and not cancelled.is_set():

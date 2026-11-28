@@ -343,7 +343,8 @@ async def _run(console: Console, config: Config) -> None:
                         await _connect(client, console)
                     if key == "r" and not await show_advance_review_modal(console, client):
                         continue
-                    await run_learning_session(client, config, console)
+                    with audio_engine.word_output():
+                        await run_learning_session(client, config, console)
                     return
                 except StudyError as exc:
                     await client.close()
